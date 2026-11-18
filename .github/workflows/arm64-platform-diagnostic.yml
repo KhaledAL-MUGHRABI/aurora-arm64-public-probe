@@ -1,0 +1,136 @@
+name: ARM64 platform inspect diagnostic
+on:
+  workflow_dispatch:
+permissions: {}
+concurrency:
+  group: arm64-readonly-host-probe
+  cancel-in-progress: false
+jobs:
+  diagnostic:
+    runs-on: ubuntu-26.04-arm
+    timeout-minutes: 5
+    steps:
+      - name: Compare CLI and Engine platform inspection
+        shell: bash
+        run: |
+          set -euo pipefail
+          export LC_ALL=C
+          test "$(uname -m)" = aarch64
+          . /etc/os-release
+          test "$ID/$VERSION_ID" = ubuntu/26.04
+          python3 -I -B - <<'PY'
+          import hashlib
+          import json
+          import os
+          import re
+          import subprocess
+          import sys
+          from urllib.parse import urlencode
+
+          SOCKET = "/var/run/docker.sock"
+          DOCKER = ["sudo", "-n", "--", "docker", "--host", "unix://" + SOCKET]
+
+
+          def invoke(argv):
+              result = subprocess.run(argv, capture_output=True, timeout=15, check=False)
+              return result.returncode, result.stdout, result.stderr
+
+
+          def classify(data, reference):
+              line = data.decode("utf-8", errors="replace").strip()
+              pattern = r'(?:(?:Error response from daemon|Error): )?(?:No such image: ["\']?REF["\']?|image ["\']?REF["\']?(?::)? not found)'
+              if re.fullmatch(pattern.replace("REF", re.escape(reference)), line, re.I):
+                  return "IMAGE_ABSENT"
+              if re.search(r"(?i)client version .*too old|requires API version|minimum supported API version", line):
+                  return "API_ERROR"
+              if re.search(r"(?i)unknown flag|invalid platform|invalid reference format|failed to parse platform|invalid character .*looking for beginning of value", line):
+                  return "ARGUMENT_ERROR"
+              if re.search(r"(?i)internal server error|rpc error: code = (?:Internal|Unknown)", line):
+                  return "INTERNAL_ERROR"
+              return "EMPTY" if not line else "UNCLASSIFIED"
+
+
+          def emit(name, data, category):
+              # Log only fixed categories and fingerprints, including for unknown responses.
+              print(f"{name}: bytes={len(data)} category={category} sha256={hashlib.sha256(data).hexdigest()}")
+
+
+          def http(api, reference, platform):
+              query = urlencode({"platform": platform})
+              url = f"http://localhost/v{api}/images/{reference}/json?{query}"
+              rc, stdout, stderr = invoke([
+                  "sudo", "-n", "--", "curl", "--disable", "--silent", "--show-error",
+                  "--noproxy", "*", "--unix-socket", SOCKET, "--max-time", "8",
+                  "--max-filesize", "16384", "--request", "GET", "--write-out",
+                  "\n%{http_code}", url,
+              ])
+              body, sep, status = stdout.rpartition(b"\n")
+              emit("api.stderr", stderr, "REDACTED" if stderr else "EMPTY")
+              if rc or not sep or not re.fullmatch(rb"[1-5][0-9]{2}", status):
+                  emit("api.stdout", stdout, "UNVERIFIED")
+                  print(f"api.curl_exit={rc}")
+                  return None, "TRANSPORT_UNVERIFIED"
+              try:
+                  parsed = json.loads(body)
+                  message = parsed.get("message", "") if isinstance(parsed, dict) else ""
+              except (ValueError, UnicodeError):
+                  message = ""
+              category = classify(message.encode(), reference) if isinstance(message, str) else "UNCLASSIFIED"
+              emit("api.response", body, category)
+              print(f"api.http_status={status.decode()}")
+              return int(status), category
+
+
+          def decision(rc, out, cli, actual, control):
+              status, category = actual
+              if rc == 0 or out.strip() or status == 200:
+                  return "FAIL", "UNEXPECTED_INSPECTION_OUTPUT"
+              if cli in {"API_ERROR", "ARGUMENT_ERROR", "INTERNAL_ERROR"}:
+                  return "FAIL", "CLI_" + cli
+              if status is not None and (status in (400, 401, 403, 405) or status >= 500):
+                  return "FAIL", "ENGINE_REQUEST_FAILED"
+              if (rc == 1 and cli == "IMAGE_ABSENT" and actual == (404, "IMAGE_ABSENT")
+                      and control == (400, "ARGUMENT_ERROR")):
+                  return "PASS", "PLATFORM_REQUEST_ACCEPTED_IMAGE_ABSENT"
+              return "UNKNOWN", "INSUFFICIENT_CORROBORATION"
+
+
+          def main():
+              print("DAEMON_EXCLUSIVITY_UNVERIFIED")
+              print("OCI_IMPORT_NOT_RUN")
+              if any(os.environ.get(k) for k in ("DOCKER_HOST", "DOCKER_CONTEXT", "DOCKER_API_VERSION")):
+                  return "FAIL", "ENDPOINT_OR_API_OVERRIDE"
+              rc, out, err = invoke(DOCKER + ["version", "--format",
+                  "{{.Client.APIVersion}}|{{.Server.APIVersion}}|{{.Server.Os}}|{{.Server.Arch}}"])
+              version = re.fullmatch(rb"(1\.[0-9]+)\|(1\.[0-9]+)\|linux\|arm64\s*", out)
+              if rc or err or not version:
+                  emit("version.stdout", out, "REDACTED")
+                  emit("version.stderr", err, "REDACTED")
+                  return "UNKNOWN", "DOCKER_VERSION_UNVERIFIED"
+              api, maximum = (x.decode() for x in version.groups())
+              print(f"api.negotiated={api} api.maximum={maximum}")
+              if min(int(api.split(".")[1]), int(maximum.split(".")[1])) < 49:
+                  return "FAIL", "BLOCKED_API_TOO_OLD"
+              if int(api.split(".")[1]) > int(maximum.split(".")[1]):
+                  return "FAIL", "API_CONTRADICTION"
+              identity = ":".join(os.environ[k] for k in ("GITHUB_RUN_ID", "GITHUB_RUN_ATTEMPT"))
+              reference = "sha256:" + hashlib.sha256(("platform-diagnostic:" + identity).encode()).hexdigest()
+              rc, out, err = invoke(DOCKER + ["image", "inspect", "--platform", "linux/arm64/v8",
+                                            "--format", "{{.Id}}", reference])
+              cli = classify(err, reference)
+              print(f"cli.exit={rc}")
+              emit("cli.stdout", out, "REDACTED" if out else "EMPTY")
+              emit("cli.stderr", err, cli)
+              actual = http(api, reference, json.dumps({"os": "linux", "architecture": "arm64", "variant": "v8"}))
+              control = http(api, reference, "{")
+              return decision(rc, out, cli, actual, control)
+
+
+          if __name__ == "__main__":
+              try:
+                  verdict, reason = main()
+              except (OSError, KeyError, subprocess.TimeoutExpired):
+                  verdict, reason = "UNKNOWN", "DIAGNOSTIC_TRANSPORT_UNAVAILABLE"
+              print(f"PLATFORM_DIAGNOSTIC={verdict} reason={reason}")
+              sys.exit(0 if verdict == "PASS" else 1)
+          PY
