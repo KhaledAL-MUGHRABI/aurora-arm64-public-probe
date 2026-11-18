@@ -1,0 +1,464 @@
+name: ARM64 verified OCI import v2
+on:
+  workflow_dispatch:
+permissions: {}
+concurrency:
+  group: arm64-readonly-host-probe
+  cancel-in-progress: false
+jobs:
+  import:
+    runs-on: ubuntu-26.04-arm
+    timeout-minutes: 12
+    steps:
+      - name: Verify public OCI and conditionally import once
+        shell: bash
+        run: |
+          set -euo pipefail
+          export LC_ALL=C
+          python3 -I -B - <<'PY'
+          """Build a single-platform OCI image-layout tar, without a Docker daemon."""
+          import gzip
+          import hashlib
+          import io
+          import json
+          from pathlib import Path
+          import shutil
+          import tarfile
+          import tempfile
+          import urllib.request
+
+          INDEX = "dd2bf3ce2dc83a81674cf7f217fcfd8a5009a4b325dda5b843bfee82a06cff6f"
+          MANIFEST = "15364b278fab4a982ae09243c788e4df96a31a5b4bed50e6dab2d83420690653"
+          CONFIG = "2e7ed4ea03deedbb45c26c68bf2a7090dc68dd8518a9c75928c4b9b0f59bc411"
+
+
+
+          import errno
+          import grp
+          import os
+          import platform
+          import pwd
+          import re
+          import shlex
+          import stat
+          import subprocess
+          import sys
+          from urllib.parse import quote, urlencode, urlsplit
+
+          SOCKET = "/var/run/docker.sock"
+          DOCKER = ["sudo", "-n", "--", "docker", "--host", "unix://" + SOCKET]
+          ACCEPT = ", ".join(("application/vnd.oci.image.index.v1+json",
+                              "application/vnd.oci.image.manifest.v1+json",
+                              "application/vnd.docker.distribution.manifest.list.v2+json",
+                              "application/vnd.docker.distribution.manifest.v2+json"))
+
+
+          class PublicRedirect(urllib.request.HTTPRedirectHandler):
+              def redirect_request(self, req, fp, code, msg, headers, target):
+                  parsed = urlsplit(target)
+                  if (parsed.scheme != "https" or parsed.username or parsed.password or
+                          parsed.hostname not in {
+                              "production.cloudflare.docker.com",
+                              "docker-images-prod.6aa30f8b08e16409b46e0173d6de2f56.r2.cloudflarestorage.com"}):
+                      raise ValueError("registry redirect unapproved")
+                  return urllib.request.Request(target, headers={"Accept": ACCEPT})
+
+
+          OPENER = urllib.request.build_opener(urllib.request.ProxyHandler({}), PublicRedirect())
+
+
+          def fetch(token, kind, pin, size=None, path=None):
+              if not re.fullmatch("[a-f0-9]{64}", pin):
+                  raise ValueError("invalid registry digest")
+              cap = 1048576 if size is None else size
+              url = f"https://registry-1.docker.io/v2/library/postgres/{kind}/sha256:{pin}"
+              request = urllib.request.Request(url, headers={"Authorization": "Bearer " + token, "Accept": ACCEPT})
+              output = io.BytesIO() if path is None else path.open("xb")
+              with output, OPENER.open(request, timeout=30) as response:
+                  digest, count = hashlib.sha256(), 0
+                  while chunk := response.read(1024**2):
+                      count += len(chunk)
+                      if count > cap:
+                          raise ValueError("registry object oversized")
+                      digest.update(chunk)
+                      output.write(chunk)
+                  if digest.hexdigest() != pin or size is not None and count != size:
+                      raise ValueError("registry object digest or size mismatch")
+                  return output.getvalue() if path is None else None
+
+
+          def read(args):
+              result = subprocess.run(args, capture_output=True, timeout=12, check=False)
+              if result.returncode or result.stderr or len(result.stdout) > 1048576:
+                  raise ValueError("read-only admission command failed")
+              return result.stdout.decode().strip()
+
+
+
+          LIBNETWORK = re.compile(r"/run/docker/libnetwork/[0-9a-f]{12}\.sock")
+          API_SOCKET = "/run/docker.sock"
+
+
+          def normalized(path):
+              return "/run/" + path[9:] if path.startswith("/var/run/") else path
+
+
+          def check_configuration(pid):
+              # Reject host and exec-root overrides, including ones not visible in systemd defaults.
+              args = Path(f"/proc/{pid}/cmdline").read_bytes().decode().rstrip("\0").split("\0")
+              if not args or Path(args[0]).name != "dockerd":
+                  raise ValueError("unexpected dockerd command")
+              allowed = {"-H", "fd://", "--host=fd://", "-H=fd://",
+                         "--containerd=/run/containerd/containerd.sock",
+                         "--containerd=/var/run/containerd/containerd.sock"}
+              tail = args[1:]
+              hosts = sum(a in {"--host=fd://", "-H=fd://"} for a in tail)
+              hosts += sum(pair == ["-H", "fd://"] for pair in zip_pairs(tail))
+              if (any(a not in allowed for a in tail) or hosts != 1
+                      or tail.count("fd://") != tail.count("-H")
+                      or any(pair[0] == "-H" and pair[1] != "fd://" for pair in zip_pairs(tail))
+                      or tail[-1] == "-H"):
+                  raise ValueError("dockerd launch options outside model")
+              service = read(["systemctl", "show", "docker.service", "--property", "ExecStart", "--value"])
+              match = re.search(r"argv\[\]=([^;]+?)\s*;", service)
+              if not match or shlex.split(match[1]) != args:
+                  raise ValueError("docker.service ExecStart differs from process")
+              listen = read(["systemctl", "show", "docker.socket", "--property", "Listen", "--value"])
+              if normalized(listen) != API_SOCKET + " (Stream)":
+                  raise ValueError("docker.socket has unexpected endpoint")
+              raw = read(["sudo", "-n", "--", "python3", "-I", "-B", "-c",
+                          "from pathlib import Path; p=Path('/etc/docker/daemon.json'); "
+                          "print(p.open().read(65537) if p.exists() else '{}')"])
+              config = json.loads(raw, object_pairs_hook=unique)
+              if (not isinstance(config, dict) or len(raw) > 65536
+                      or {"hosts", "exec-root", "config-file", "tls", "tlsverify", "group",
+                          "authorization-plugins"} & config.keys()):
+                  raise ValueError("daemon configuration outside model")
+
+
+          def zip_pairs(values):
+              return [values[i:i+2] for i in range(len(values)-1)]
+
+
+          def unique(rows):
+              result = {}
+              for key, value in rows:
+                  if key in result:
+                      raise ValueError("duplicate daemon configuration key")
+                  result[key] = value
+              return result
+
+
+          def socket_metadata(pid, path, fd, kernel_inode):
+              # Kernel socket inode and filesystem inode are distinct. Bind the ss row
+              # to the process FD and check the filesystem socket separately.
+              program = """
+          import json, os, stat, sys
+          from pathlib import Path
+          pid, path, fd, inode = sys.argv[1:]
+          p = Path(path)
+          s = p.lstat()
+          parents = all((q.lstat().st_uid == 0 and stat.S_ISDIR(q.lstat().st_mode)
+                         and not (q.lstat().st_mode & 0o022)) for q in p.parents)
+          print(json.dumps([os.readlink(f'/proc/{pid}/fd/{fd}') == f'socket:[{inode}]',
+                            str(p.resolve(strict=True)) == path, parents, stat.S_ISSOCK(s.st_mode),
+                            s.st_uid, s.st_gid, stat.S_IMODE(s.st_mode), s.st_dev, s.st_ino]))
+          """
+              return json.loads(read(["sudo", "-n", "--", "python3", "-I", "-B", "-c",
+                                      program, str(pid), path, fd, kernel_inode]))
+
+
+          def classify_listeners(lines, pid, version, metadata=socket_metadata):
+              accepted = {}
+              counts = {"api": 0, "libnetwork": 0, "unexpected": 0}
+              for line in lines.splitlines():
+                  fields = line.split()
+                  owners = re.findall(r'\("([^"]+)",pid=([0-9]+),fd=([0-9]+)\)', line)
+                  path = normalized(fields[4]) if len(fields) >= 8 else ""
+                  belongs = [(name, fd) for name, owner, fd in owners if owner == str(pid)]
+                  if not belongs and path != API_SOCKET and not LIBNETWORK.fullmatch(path):
+                      if f"pid={pid}," in line:
+                          counts["unexpected"] += 1
+                      continue
+                  role = ("engine_api" if path == API_SOCKET else
+                          "libnetwork_candidate" if LIBNETWORK.fullmatch(path) else "unknown")
+                  if (len(belongs) != 1 or belongs[0][0] != "dockerd" or
+                          len(fields) < 8 or fields[:2] != ["u_str", "LISTEN"] or
+                          not fields[5].isdigit() or role == "unknown" or path in accepted):
+                      print(f"socket role={role} dockerd={'yes' if belongs else 'no'} status=refused")
+                      counts["unexpected"] += 1
+                      continue
+                  if role == "engine_api" and any(
+                          owner != str(pid) and (name, owner) != ("systemd", "1")
+                          for name, owner, _ in owners):
+                      print("socket role=engine_api dockerd=yes status=unexpected_fd_owner")
+                      counts["unexpected"] += 1
+                      continue
+                  if (role == "libnetwork_candidate" and
+                          (version != "29.4.2" or owners != [("dockerd", str(pid), belongs[0][1])])):
+                      print("socket role=libnetwork_candidate dockerd=yes status=version_or_owner_unverified")
+                      counts["unexpected"] += 1
+                      continue
+                  linked, exact, parents, is_socket, uid, gid, mode, dev, ino = metadata(pid, path, belongs[0][1], fields[5])
+                  expected = 0o660 if role == "engine_api" else 0o600
+                  print(f"socket role={role} dockerd=yes uid={uid} mode={mode:04o}")
+                  if not (linked and exact and parents and is_socket and uid == 0 and mode == expected
+                          and (role == "engine_api" or gid == 0)):
+                      counts["unexpected"] += 1
+                      continue
+                  accepted[path] = (dev, ino, int(fields[5]), uid, gid, mode)
+                  counts["api" if role == "engine_api" else "libnetwork"] += 1
+              print(f"listeners api={counts['api']} libnetwork={counts['libnetwork']} unexpected={counts['unexpected']}")
+              if counts["api"] != 1 or counts["libnetwork"] > 1 or counts["unexpected"]:
+                  raise ValueError("Unix listener classification refused")
+              return accepted
+
+          def check_peers(peers, listeners):
+              if any(
+                  token.startswith("/") and normalized(token) in listeners
+                  for line in peers.splitlines() for token in line.split()
+              ):
+                  raise ValueError("concurrent socket client observed")
+
+
+          def admission():
+              if (os.environ.get("RUNNER_ENVIRONMENT") != "github-hosted"
+                      or os.environ.get("GITHUB_REPOSITORY", "").lower() != "khaledal-mughrabi/aurora-arm64-public-probe"
+                      or os.environ.get("GITHUB_EVENT_NAME") != "workflow_dispatch"
+                      or os.environ.get("GITHUB_REF") != "refs/heads/main"
+                      or os.environ.get("GITHUB_RUN_ATTEMPT") != "1"
+                      or platform.machine() != "aarch64"
+                      or (platform.freedesktop_os_release().get("ID"),
+                          platform.freedesktop_os_release().get("VERSION_ID")) != ("ubuntu", "26.04")
+                      or any(os.environ.get(k) for k in ("DOCKER_HOST", "DOCKER_CONTEXT", "DOCKER_API_VERSION"))
+                      or os.getuid() == 0):
+                  raise ValueError("runner admission failed")
+              sock = Path(SOCKET)
+              st = sock.stat()
+              if not stat.S_ISSOCK(st.st_mode) or st.st_uid != 0 or stat.S_IMODE(st.st_mode) != 0o660:
+                  raise ValueError("socket access unexpected")
+              try:
+                  if os.getxattr(sock, "system.posix_acl_access"):
+                      raise ValueError("additional socket ACL")
+              except OSError as exc:
+                  if exc.errno not in {errno.ENODATA, errno.ENOTSUP}:
+                      raise
+              group = grp.getgrgid(st.st_gid)
+              users = set(group.gr_mem) | {u.pw_name for u in pwd.getpwall() if u.pw_gid == st.st_gid}
+              if not users <= {"root", pwd.getpwuid(os.getuid()).pw_name}:
+                  raise ValueError("foreign socket principal")
+              pid = int(read(["systemctl", "show", "docker.service", "--value", "--property", "MainPID"]))
+              if pid <= 1 or Path(f"/proc/{pid}/comm").read_text().strip() != "dockerd":
+                  raise ValueError("daemon identity unverified")
+              if Path("/var/run").resolve(strict=True) != Path("/run"):
+                  raise ValueError("runtime socket path alias unverified")
+              check_configuration(pid)
+              version = read(DOCKER + ["version", "--format", "{{.Server.Version}}"])
+              listeners = classify_listeners(read(["sudo", "-n", "--", "ss", "-H", "-xlp"]), pid, version)
+              if listeners[API_SOCKET][:2] != (st.st_dev, st.st_ino):
+                  raise ValueError("primary socket replaced")
+              tcp = read(["sudo", "-n", "--", "ss", "-H", "-ltnp"])
+              if f"pid={pid}," in tcp or '"dockerd"' in tcp:
+                  raise ValueError("Docker TCP listener present")
+              if read(DOCKER + ["context", "show"]) != "default":
+                  raise ValueError("unexpected Docker context")
+              raw = read(DOCKER + ["version", "--format", "{{.Client.APIVersion}}|{{.Server.APIVersion}}|{{.Server.Os}}|{{.Server.Arch}}"])
+              api = re.fullmatch(r"1\.([0-9]+)\|1\.([0-9]+)\|linux\|arm64", raw)
+              if not api or not 49 <= int(api[1]) <= int(api[2]):
+                  raise ValueError("Docker API unsupported")
+              info = json.loads(read(DOCKER + ["info", "--format", "{{json .}}"]))
+              if [v for k, v in info["DriverStatus"] if k == "driver-type"] != ["io.containerd.snapshotter.v1"]:
+                  raise ValueError("Containerd store unverified")
+              if not info["ID"] or info["Containers"] != 0 or read(DOCKER + ["ps", "-aq"]):
+                  raise ValueError("daemon workload or identity unexpected")
+              counts = read(["sudo", "-n", "--", "stat", "-f", "-c", "%a %S", info["DockerRootDir"]])
+              free, block = map(int, counts.split())
+              if free * block < 2 * 1024**3:
+                  raise ValueError("daemon disk headroom insufficient")
+              mem = re.search(r"(?m)^MemAvailable:\s+([0-9]+) kB$", Path("/proc/meminfo").read_text())
+              if (not mem or int(mem[1]) < 2097152 or (os.cpu_count() or 0) < 2
+                      or int(read(["sudo", "-n", "--", "stat", "-f", "-c", "%d", info["DockerRootDir"]])) < 10000):
+                  raise ValueError("daemon resource headroom insufficient")
+              peers = read(["sudo", "-n", "--", "ss", "-H", "-xnp", "state", "established"])
+              check_peers(peers, listeners)
+              return f"1.{api[1]}", (info["ID"], pid, version, tuple(sorted(listeners.items())))
+
+
+          def inspect(ref, api, selected=False):
+              platform_json = json.dumps({"os": "linux", "architecture": "arm64", "variant": "v8"})
+              query = "?" + urlencode({"platform": platform_json}) if selected else ""
+              raw = read(["sudo", "-n", "--", "curl", "--disable", "--silent", "--show-error",
+                          "--noproxy", "*", "--unix-socket", SOCKET, "--max-time", "8",
+                          "--max-filesize", "65536", "--request", "GET", "--write-out", "\n%{http_code}",
+                          f"http://localhost/v{api}/images/{quote(ref, safe='/:@')}/json{query}"])
+              body, _, status = raw.rpartition("\n")
+              if status not in {"200", "404"}:
+                  raise ValueError("unexpected image API response")
+              doc = json.loads(body)
+              if status == "404":
+                  if doc.get("message") not in {"No such image: " + ref, "No such image: " + ref.removeprefix("docker.io/library/")}:
+                      raise ValueError("image absence not proved")
+                  return None
+              return doc
+
+
+          def verify_image(doc, descriptor, diffs):
+              observed = (doc or {}).get("Descriptor") or {}
+              if (not doc or doc.get("Id") != "sha256:" + MANIFEST
+                      or any(observed.get(k) != descriptor[k] for k in ("digest", "size", "mediaType"))
+                      or ("platform" in observed and observed["platform"] != descriptor["platform"])
+                      or (doc.get("Os"), doc.get("Architecture")) != ("linux", "arm64")
+                      or doc.get("RootFS") != {"Type": "layers", "Layers": diffs}
+                      or (doc.get("Config") or {}).get("Volumes") != {"/var/lib/postgresql/data": {}}):
+                  raise ValueError("imported identity not established")
+
+
+          def main():
+              attempted = False
+              content = load = selection = False
+              try:
+                  try:
+                      api, daemon = admission()
+                  except (OSError, ValueError, KeyError, TypeError, subprocess.TimeoutExpired):
+                      print("DAEMON_EXCLUSIVITY_UNVERIFIED")
+                      raise
+                  run = os.environ["GITHUB_RUN_ID"]
+                  if not re.fullmatch("[0-9]{1,24}", run):
+                      raise ValueError("unverified run identifier")
+                  tag = f"arm64-oci-probe:run-{run}"
+                  immutable = "docker.io/library/postgres@sha256:" + MANIFEST
+                  aliases = (tag, immutable, "sha256:" + MANIFEST, "sha256:" + CONFIG,
+                             "sha256:" + INDEX, "docker.io/library/postgres@sha256:" + INDEX)
+                  with OPENER.open("https://auth.docker.io/token?service=registry.docker.io&scope=repository:library/postgres:pull", timeout=15) as response:
+                      token = json.load(response)["token"]
+                  with tempfile.TemporaryDirectory(prefix="oci-probe-", dir=os.environ["RUNNER_TEMP"]) as tmp:
+                      archive, descriptor, diffs = build(Path(tmp), token, tag)
+                      content = True
+                      print("OCI_CONTENT_VERIFIED")
+                      with archive.open("rb") as stream:
+                          print("RECONSTRUCTED_TAR_SHA256=" + hashlib.file_digest(stream, "sha256").hexdigest())
+                      if any(inspect(ref, api) is not None for ref in aliases):
+                          raise ValueError("preexisting import reference")
+                      try:
+                          if admission() != (api, daemon):
+                              raise ValueError("daemon changed")
+                      except (OSError, ValueError, KeyError, TypeError, subprocess.TimeoutExpired):
+                          print("DAEMON_EXCLUSIVITY_UNVERIFIED")
+                          raise
+                      print("DAEMON_ADMISSION_PASS")
+                      attempted = True
+                      result = subprocess.run(DOCKER + ["image", "load", "--platform", "linux/arm64/v8",
+                                                       "--input", str(archive)], capture_output=True,
+                                              timeout=90, check=False)
+                      print(f"load.exit={result.returncode}")
+                      if result.returncode:
+                          print("DOCKER_IMAGE_LOAD_FAIL")
+                          raise ValueError("OCI import was not successful")
+                      load = True
+                      print("DOCKER_IMAGE_LOAD_PASS")
+                      if admission() != (api, daemon):
+                          raise ValueError("daemon changed after import")
+                      try:
+                          verify_image(inspect(tag, api, selected=True), descriptor, diffs)
+                      except (OSError, ValueError, KeyError, TypeError, subprocess.TimeoutExpired):
+                          print("ARM64_MANIFEST_SELECTION_FAIL")
+                          raise
+                      selection = True
+                      print("ARM64_MANIFEST_SELECTION_PASS")
+                      try:
+                          verify_image(inspect(immutable, api), descriptor, diffs)
+                          verify_image(inspect(immutable, api, selected=True), descriptor, diffs)
+                      except (OSError, ValueError, KeyError, TypeError, subprocess.TimeoutExpired):
+                          print("CANONICAL_REFERENCE_FAIL")
+                          raise
+                      print("CANONICAL_REFERENCE_PASS")
+                      print("NATIVE_OCI_IMPORT_PASS")
+              except (OSError, ValueError, KeyError, TypeError, subprocess.TimeoutExpired) as exc:
+                  if isinstance(exc, ValueError) and exc.args and exc.args[0] in SAFE_ERRORS:
+                      print("reason=" + exc.args[0])
+                  else:
+                      print("reason=" + type(exc).__name__)
+                  print("OCI_IMPORT_UNVERIFIED" if attempted else "OCI_IMPORT_NOT_RUN")
+                  return 1
+              finally:
+                  if not content:
+                      print("OCI_CONTENT_NOT_VERIFIED")
+                  if not attempted:
+                      print("DOCKER_IMAGE_LOAD_NOT_RUN")
+                  if not load:
+                      print("ARM64_MANIFEST_SELECTION_NOT_RUN")
+                  if not selection:
+                      print("CANONICAL_REFERENCE_NOT_RUN")
+                  print("LOCAL_TAR_EXACT_BYTES_NOT_TESTED")
+                  if attempted:
+                      print("CLEANUP_UNVERIFIED")
+              return 0
+
+          def build(root, token, tag):
+              index = json.loads(fetch(token, "manifests", INDEX))
+              manifest_raw = fetch(token, "manifests", MANIFEST)
+              config_raw = fetch(token, "blobs", CONFIG)
+              manifest, config = map(json.loads, (manifest_raw, config_raw))
+              platform = {"os": "linux", "architecture": "arm64", "variant": "v8"}
+              matches = [row for row in index["manifests"] if row.get("platform") == platform]
+              if (len(matches) != 1 or matches[0]["digest"] != "sha256:" + MANIFEST
+                      or matches[0]["size"] != len(manifest_raw)
+                      or manifest["config"]["digest"] != "sha256:" + CONFIG
+                      or manifest["config"]["size"] != len(config_raw)
+                      or (config["os"], config["architecture"]) != ("linux", "arm64")):
+                  raise ValueError("reference chain mismatch")
+              layers = list(zip(manifest["layers"], config["rootfs"]["diff_ids"], strict=True))
+              if len(layers) != 14 or sum(l["size"] for l, _ in layers) != 164706129:
+                  raise ValueError("layer inventory mismatch")
+              if shutil.disk_usage(root).free < 3 * sum(l["size"] for l, _ in layers) + 1024**3:
+                  raise ValueError("insufficient local headroom")
+              files = {}
+              for descriptor, diff_id in layers:
+                  expected = descriptor["digest"]
+                  if descriptor["mediaType"] not in {"application/vnd.oci.image.layer.v1.tar+gzip",
+                                                        "application/vnd.docker.image.rootfs.diff.tar.gzip"}:
+                      raise ValueError("unsupported layer media type")
+                  key = expected.split(":", 1)[1]
+                  path = root / key
+                  fetch(token, "blobs", key, descriptor["size"], path)
+                  with gzip.open(path, "rb") as plain:
+                      if "sha256:" + hashlib.file_digest(plain, "sha256").hexdigest() != diff_id:
+                          raise ValueError("uncompressed DiffID mismatch")
+                  files["blobs/sha256/" + key] = path
+                  print(f"{expected} {descriptor['size']} {diff_id} PASS", flush=True)
+              tagged = dict(matches[0], annotations={"org.opencontainers.image.ref.name":
+                                                     tag})
+              files.update({
+                  "blobs/sha256/" + MANIFEST: manifest_raw,
+                  "blobs/sha256/" + CONFIG: config_raw,
+                  "oci-layout": b'{"imageLayoutVersion":"1.0.0"}\n',
+                  "index.json": json.dumps({"schemaVersion": 2, "manifests": [tagged]},
+                                           sort_keys=True, separators=(",", ":")).encode(),
+              })
+              candidate = root / "image.tar"
+              with tarfile.open(candidate, mode="x", format=tarfile.USTAR_FORMAT) as archive:
+                  for name, source in sorted(files.items()):
+                      info = tarfile.TarInfo(name)
+                      info.size = len(source) if isinstance(source, bytes) else source.stat().st_size
+                      if isinstance(source, bytes):
+                          archive.addfile(info, io.BytesIO(source))
+                      else:
+                          with source.open("rb") as blob:
+                              archive.addfile(info, blob)
+              with tarfile.open(candidate, "r") as archive:
+                  if archive.getnames() != sorted(files):
+                      raise ValueError("OCI archive differs")
+                  for member in archive:
+                      with archive.extractfile(member) as content:
+                          observed = hashlib.file_digest(content, "sha256").hexdigest()
+                      if member.name.startswith("blobs/sha256/") and observed != member.name.rsplit("/", 1)[1]:
+                          raise ValueError("archive blob digest mismatch")
+                      if isinstance(files[member.name], bytes) and observed != hashlib.sha256(files[member.name]).hexdigest():
+                          raise ValueError("archive metadata digest mismatch")
+              return candidate, matches[0], config["rootfs"]["diff_ids"]
+
+          SAFE_ERRORS = ('Containerd store unverified', 'Docker API unsupported', 'Docker TCP listener present', 'OCI archive differs', 'OCI import was not successful', 'Unix listener classification refused', 'additional socket ACL', 'archive blob digest mismatch', 'archive metadata digest mismatch', 'concurrent socket client observed', 'daemon changed', 'daemon changed after import', 'daemon configuration outside model', 'daemon disk headroom insufficient', 'daemon identity unverified', 'daemon resource headroom insufficient', 'daemon workload or identity unexpected', 'docker.service ExecStart differs from process', 'docker.socket has unexpected endpoint', 'dockerd launch options outside model', 'duplicate daemon configuration key', 'foreign socket principal', 'image absence not proved', 'imported identity not established', 'insufficient local headroom', 'invalid registry digest', 'layer inventory mismatch', 'preexisting import reference', 'primary socket replaced', 'read-only admission command failed', 'reference chain mismatch', 'registry object digest or size mismatch', 'registry object oversized', 'registry redirect unapproved', 'runner admission failed', 'runtime socket path alias unverified', 'socket access unexpected', 'uncompressed DiffID mismatch', 'unexpected Docker context', 'unexpected dockerd command', 'unexpected image API response', 'unsupported layer media type', 'unverified run identifier')
+
+          if __name__ == '__main__':
+              sys.exit(main())
+          PY
