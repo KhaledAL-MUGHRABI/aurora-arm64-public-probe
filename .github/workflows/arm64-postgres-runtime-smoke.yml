@@ -1,0 +1,1110 @@
+name: PostgreSQL 16.16 ARM64 runtime smoke
+on:
+  workflow_dispatch:
+permissions: {}
+concurrency:
+  group: arm64-readonly-host-probe
+  cancel-in-progress: false
+jobs:
+  runtime:
+    runs-on: ubuntu-26.04-arm
+    timeout-minutes: 12
+    steps:
+      - name: Verify OCI prerequisite and exercise PostgreSQL runtime
+        shell: bash
+        run: |
+          set -euo pipefail
+          export LC_ALL=C
+          python3 -I -B - <<'PY'
+          """Build a single-platform OCI image-layout tar, without a Docker daemon."""
+          import gzip
+          import hashlib
+          import io
+          import json
+          from pathlib import Path
+          import shutil
+          import tarfile
+          import tempfile
+          import urllib.request
+
+          INDEX = "dd2bf3ce2dc83a81674cf7f217fcfd8a5009a4b325dda5b843bfee82a06cff6f"
+          MANIFEST = "15364b278fab4a982ae09243c788e4df96a31a5b4bed50e6dab2d83420690653"
+          CONFIG = "2e7ed4ea03deedbb45c26c68bf2a7090dc68dd8518a9c75928c4b9b0f59bc411"
+
+
+
+          import errno
+          import grp
+          import os
+          import platform
+          import pwd
+          import re
+          import shlex
+          import signal
+          import time
+          import stat
+          import subprocess
+          import sys
+          from urllib.parse import quote, urlencode, urlsplit
+
+          SOCKET = "/var/run/docker.sock"
+          DOCKER = ["sudo", "-n", "--", "docker", "--host", "unix://" + SOCKET]
+          ACCEPT = ", ".join(("application/vnd.oci.image.index.v1+json",
+                              "application/vnd.oci.image.manifest.v1+json",
+                              "application/vnd.docker.distribution.manifest.list.v2+json",
+                              "application/vnd.docker.distribution.manifest.v2+json"))
+
+
+          CDN_HOSTS = frozenset({
+              "production.cloudfront.docker.com",
+              "production.cloudflare.docker.com",
+              "docker-images-prod.6aa30f8b08e16409b46e0173d6de2f56.r2.cloudflarestorage.com",
+          })
+
+
+          class PublicRedirect(urllib.request.HTTPRedirectHandler):
+              def redirect_request(self, req, fp, code, msg, headers, target):
+                  origin, kind, host = "other", "other", "unverified"
+                  allowed = False
+                  try:
+                      source = urlsplit(req.full_url)
+                      if source.hostname == "registry-1.docker.io":
+                          origin = "registry-1.docker.io"
+                          if re.fullmatch(r"/v2/library/postgres/blobs/sha256:[a-f0-9]{64}", source.path):
+                              kind = "blob"
+                          elif source.path.startswith("/v2/library/postgres/manifests/"):
+                              kind = "manifest"
+                      elif source.hostname == "auth.docker.io":
+                          origin, kind = "auth.docker.io", "token"
+                      elif source.hostname in CDN_HOSTS:
+                          origin, kind = "cdn", "redirected"
+                      parsed = urlsplit(target)
+                      candidate = parsed.hostname or ""
+                      if re.fullmatch(r"[a-z0-9][a-z0-9.-]{0,252}", candidate):
+                          host = candidate
+                      allowed = (
+                          origin == "registry-1.docker.io" and kind == "blob"
+                          and source.scheme == "https" and source.netloc == "registry-1.docker.io"
+                          and not source.query and not source.fragment
+                          and req.get_method() == "GET"
+                          and bool(re.fullmatch(r"Bearer [!-~]+", req.get_header("Authorization", "")))
+                          and code == 307 and parsed.scheme == "https"
+                          and host in CDN_HOSTS and parsed.netloc in {host, host + ":443"}
+                          and "#" not in target and not any(ord(c) < 33 or ord(c) == 127 for c in target)
+                      )
+                  except ValueError:
+                      pass
+                  print(f"registry_redirect origin={origin} object={kind} http={int(code)} "
+                        f"target_host={host} decision={'allow' if allowed else 'refuse'}", flush=True)
+                  if not allowed:
+                      raise ValueError("registry redirect unapproved")
+                  # New request, no inherited credentials. A CDN-origin redirect cannot
+                  # satisfy the source check above, limiting each blob to one hop.
+                  return urllib.request.Request(target, headers={"Accept": ACCEPT}, method="GET")
+
+
+          OPENER = urllib.request.build_opener(urllib.request.ProxyHandler({}), PublicRedirect())
+
+
+          def fetch(token, kind, pin, size=None, path=None):
+              if not re.fullmatch("[a-f0-9]{64}", pin):
+                  raise ValueError("invalid registry digest")
+              cap = 1048576 if size is None else size
+              url = f"https://registry-1.docker.io/v2/library/postgres/{kind}/sha256:{pin}"
+              request = urllib.request.Request(url, headers={"Authorization": "Bearer " + token, "Accept": ACCEPT})
+              output = io.BytesIO() if path is None else path.open("xb")
+              with output, OPENER.open(request, timeout=30) as response:
+                  digest, count = hashlib.sha256(), 0
+                  while chunk := response.read(1024**2):
+                      count += len(chunk)
+                      if count > cap:
+                          raise ValueError("registry object oversized")
+                      digest.update(chunk)
+                      output.write(chunk)
+                  if digest.hexdigest() != pin or size is not None and count != size:
+                      raise ValueError("registry object digest or size mismatch")
+                  return output.getvalue() if path is None else None
+
+
+          def read(args):
+              result = subprocess.run(args, capture_output=True, timeout=12, check=False)
+              if result.returncode or result.stderr or len(result.stdout) > 1048576:
+                  raise ValueError("read-only admission command failed")
+              return result.stdout.decode().strip()
+
+
+
+          LIBNETWORK = re.compile(r"/run/docker/libnetwork/[0-9a-f]{12}\.sock")
+          API_SOCKET = "/run/docker.sock"
+          METRICS_SOCKET = "/run/docker/metrics.sock"
+
+
+          def normalized(path):
+              return "/run/" + path[9:] if path.startswith("/var/run/") else path
+
+
+          def check_configuration(pid):
+              # Reject host and exec-root overrides, including ones not visible in systemd defaults.
+              args = Path(f"/proc/{pid}/cmdline").read_bytes().decode().rstrip("\0").split("\0")
+              if not args or Path(args[0]).name != "dockerd":
+                  raise ValueError("unexpected dockerd command")
+              allowed = {"-H", "fd://", "--host=fd://", "-H=fd://",
+                         "--containerd=/run/containerd/containerd.sock",
+                         "--containerd=/var/run/containerd/containerd.sock"}
+              tail = args[1:]
+              hosts = sum(a in {"--host=fd://", "-H=fd://"} for a in tail)
+              hosts += sum(pair == ["-H", "fd://"] for pair in zip_pairs(tail))
+              if (any(a not in allowed for a in tail) or hosts != 1
+                      or tail.count("fd://") != tail.count("-H")
+                      or any(pair[0] == "-H" and pair[1] != "fd://" for pair in zip_pairs(tail))
+                      or tail[-1] == "-H"):
+                  raise ValueError("dockerd launch options outside model")
+              service = read(["systemctl", "show", "docker.service", "--property", "ExecStart", "--value"])
+              match = re.search(r"argv\[\]=([^;]+?)\s*;", service)
+              if not match or shlex.split(match[1]) != args:
+                  raise ValueError("docker.service ExecStart differs from process")
+              listen = read(["systemctl", "show", "docker.socket", "--property", "Listen", "--value"])
+              if normalized(listen) != API_SOCKET + " (Stream)":
+                  raise ValueError("docker.socket has unexpected endpoint")
+              raw = read(["sudo", "-n", "--", "python3", "-I", "-B", "-c",
+                          "from pathlib import Path; p=Path('/etc/docker/daemon.json'); "
+                          "print(p.open().read(65537) if p.exists() else '{}')"])
+              config = json.loads(raw, object_pairs_hook=unique)
+              if (not isinstance(config, dict) or len(raw) > 65536
+                      or {"hosts", "exec-root", "config-file", "tls", "tlsverify", "group",
+                          "authorization-plugins"} & config.keys()):
+                  raise ValueError("daemon configuration outside model")
+
+
+          def zip_pairs(values):
+              return [values[i:i+2] for i in range(len(values)-1)]
+
+
+          def unique(rows):
+              result = {}
+              for key, value in rows:
+                  if key in result:
+                      raise ValueError("duplicate daemon configuration key")
+                  result[key] = value
+              return result
+
+
+          def socket_metadata(pid, path, fd, kernel_inode):
+              # Kernel socket inode and filesystem inode are distinct. Bind the ss row
+              # to the process FD and check the filesystem socket separately.
+              program = """
+          import json, os, stat, sys
+          from pathlib import Path
+          pid, path, fd, inode = sys.argv[1:]
+          p = Path(path)
+          s = p.lstat()
+          parents = all((q.lstat().st_uid == 0 and stat.S_ISDIR(q.lstat().st_mode)
+                         and not (q.lstat().st_mode & 0o022)) for q in p.parents)
+          print(json.dumps([os.readlink(f'/proc/{pid}/fd/{fd}') == f'socket:[{inode}]',
+                            str(p.resolve(strict=True)) == path, parents, stat.S_ISSOCK(s.st_mode),
+                            s.st_uid, s.st_gid, stat.S_IMODE(s.st_mode), s.st_dev, s.st_ino]))
+          """
+              return json.loads(read(["sudo", "-n", "--", "python3", "-I", "-B", "-c",
+                                      program, str(pid), path, fd, kernel_inode]))
+
+
+          def metrics_permissions(pid, dev, ino):
+              # Bind the permissions check to the same filesystem object already
+              # identified by socket_metadata. Do not connect to the socket.
+              program = """
+          import errno, json, os, re, stat, sys
+          from pathlib import Path
+          pid, dev, ino = map(int, sys.argv[1:])
+          p = Path('/run/docker/metrics.sock')
+          s = p.lstat()
+          text = Path(f'/proc/{pid}/status').read_text()
+          mask = re.findall(r'^Umask:\\s+([0-7]{4})$', text, re.M)
+          gid = re.findall(r'^Gid:\\s+\\d+\\s+(\\d+)\\s+\\d+\\s+(\\d+)$', text, re.M)
+          try:
+              os.getxattr(p, 'system.posix_acl_access', follow_symlinks=False)
+          except OSError as e:
+              no_acl = e.errno == errno.ENODATA
+          else:
+              no_acl = False
+          expected = 0o777 & ~int(mask[0], 8) if len(mask) == 1 else -1
+          mode = stat.S_IMODE(s.st_mode)
+          print(json.dumps([s.st_dev == dev and s.st_ino == ino and stat.S_ISSOCK(s.st_mode),
+                            s.st_uid, s.st_gid, mode, expected, no_acl,
+                            len(gid) == 1 and int(gid[0][0]) == s.st_gid == int(gid[0][1])]))
+          """
+              return json.loads(read(["sudo", "-n", "--", "python3", "-I", "-B", "-c",
+                                      program, str(pid), str(dev), str(ino)]))
+
+
+          def classify_listeners(lines, pid, version, metadata=socket_metadata,
+                                 metrics_metadata=metrics_permissions):
+              accepted = {}
+              counts = {"api": 0, "libnetwork": 0, "metrics": 0, "unexpected": 0}
+              for line in lines.splitlines():
+                  fields = line.split()
+                  owners = re.findall(r'\("([^"]+)",pid=([0-9]+),fd=([0-9]+)\)', line)
+                  path = normalized(fields[4]) if len(fields) >= 8 else ""
+                  belongs = [(name, fd) for name, owner, fd in owners if owner == str(pid)]
+                  if not belongs and path not in {API_SOCKET, METRICS_SOCKET} and not LIBNETWORK.fullmatch(path):
+                      if f"pid={pid}," in line:
+                          counts["unexpected"] += 1
+                      continue
+                  role = ("engine_api" if path == API_SOCKET else
+                          "metrics_candidate" if path == METRICS_SOCKET else
+                          "libnetwork_candidate" if LIBNETWORK.fullmatch(path) else "unknown")
+                  if (len(belongs) != 1 or belongs[0][0] != "dockerd" or
+                          len(fields) < 8 or fields[:2] != ["u_str", "LISTEN"] or
+                          not fields[5].isdigit() or role == "unknown" or path in accepted):
+                      print(f"socket role={role} dockerd={'yes' if belongs else 'no'} status=refused")
+                      counts["unexpected"] += 1
+                      continue
+                  if role == "engine_api" and any(
+                          owner != str(pid) and (name, owner) != ("systemd", "1")
+                          for name, owner, _ in owners):
+                      print("socket role=engine_api dockerd=yes status=unexpected_fd_owner")
+                      counts["unexpected"] += 1
+                      continue
+                  if (role in {"libnetwork_candidate", "metrics_candidate"} and
+                          (version != "29.4.2" or owners != [("dockerd", str(pid), belongs[0][1])])):
+                      print(f"socket role={role} dockerd=yes status=version_or_owner_unverified")
+                      counts["unexpected"] += 1
+                      continue
+                  linked, exact, parents, is_socket, uid, gid, mode, dev, ino = metadata(pid, path, belongs[0][1], fields[5])
+                  expected = 0o660 if role == "engine_api" else 0o600
+                  print(f"socket role={role} dockerd=yes uid={uid} gid={gid} mode={mode:04o}")
+                  valid = linked and exact and parents and is_socket and uid == 0
+                  if valid and role == "metrics_candidate":
+                      same, m_uid, m_gid, m_mode, expected, no_acl, daemon_gid = metrics_metadata(pid, dev, ino)
+                      print(f"metrics mode_from_umask={expected:04o} acl={'absent' if no_acl else 'unverified'}")
+                      valid = (same and (m_uid, m_gid, m_mode) == (uid, gid, mode)
+                               and daemon_gid and no_acl and mode == expected
+                               and not (mode & 0o022) and bool(mode & 0o200))
+                      if not valid:
+                          print("socket role=metrics_candidate status=identity_or_permissions_refused")
+                  elif valid:
+                      valid = mode == expected and (role == "engine_api" or gid == 0)
+                  if not valid:
+                      counts["unexpected"] += 1
+                      continue
+                  accepted[path] = (dev, ino, int(fields[5]), uid, gid, mode)
+                  counts[{"engine_api":"api", "metrics_candidate":"metrics", "libnetwork_candidate":"libnetwork"}[role]] += 1
+              print(f"listeners api={counts['api']} libnetwork={counts['libnetwork']} metrics={counts['metrics']} unexpected={counts['unexpected']}")
+              if counts["api"] != 1 or counts["libnetwork"] > 1 or counts["metrics"] > 1 or counts["unexpected"]:
+                  raise ValueError("Unix listener classification refused")
+              return accepted
+
+          def check_peers(peers, listeners):
+              if any(
+                  token.startswith("/") and normalized(token) in listeners
+                  for line in peers.splitlines() for token in line.split()
+              ):
+                  raise ValueError("concurrent socket client observed")
+
+
+          def admission():
+              if (os.environ.get("RUNNER_ENVIRONMENT") != "github-hosted"
+                      or os.environ.get("GITHUB_REPOSITORY", "").lower() != "khaledal-mughrabi/aurora-arm64-public-probe"
+                      or os.environ.get("GITHUB_EVENT_NAME") != "workflow_dispatch"
+                      or os.environ.get("GITHUB_REF") != "refs/heads/main"
+                      or os.environ.get("GITHUB_RUN_ATTEMPT") != "1"
+                      or platform.machine() != "aarch64"
+                      or (platform.freedesktop_os_release().get("ID"),
+                          platform.freedesktop_os_release().get("VERSION_ID")) != ("ubuntu", "26.04")
+                      or any(os.environ.get(k) for k in ("DOCKER_HOST", "DOCKER_CONTEXT", "DOCKER_API_VERSION"))
+                      or os.getuid() == 0):
+                  raise ValueError("runner admission failed")
+              sock = Path(SOCKET)
+              st = sock.stat()
+              if not stat.S_ISSOCK(st.st_mode) or st.st_uid != 0 or stat.S_IMODE(st.st_mode) != 0o660:
+                  raise ValueError("socket access unexpected")
+              try:
+                  if os.getxattr(sock, "system.posix_acl_access"):
+                      raise ValueError("additional socket ACL")
+              except OSError as exc:
+                  if exc.errno not in {errno.ENODATA, errno.ENOTSUP}:
+                      raise
+              group = grp.getgrgid(st.st_gid)
+              users = set(group.gr_mem) | {u.pw_name for u in pwd.getpwall() if u.pw_gid == st.st_gid}
+              if not users <= {"root", pwd.getpwuid(os.getuid()).pw_name}:
+                  raise ValueError("foreign socket principal")
+              pid = int(read(["systemctl", "show", "docker.service", "--value", "--property", "MainPID"]))
+              if pid <= 1 or Path(f"/proc/{pid}/comm").read_text().strip() != "dockerd":
+                  raise ValueError("daemon identity unverified")
+              if Path("/var/run").resolve(strict=True) != Path("/run"):
+                  raise ValueError("runtime socket path alias unverified")
+              check_configuration(pid)
+              version = read(DOCKER + ["version", "--format", "{{.Server.Version}}"])
+              listeners = classify_listeners(read(["sudo", "-n", "--", "ss", "-H", "-xlp"]), pid, version)
+              if listeners[API_SOCKET][:2] != (st.st_dev, st.st_ino):
+                  raise ValueError("primary socket replaced")
+              tcp = read(["sudo", "-n", "--", "ss", "-H", "-ltnp"])
+              if f"pid={pid}," in tcp or '"dockerd"' in tcp:
+                  raise ValueError("Docker TCP listener present")
+              if read(DOCKER + ["context", "show"]) != "default":
+                  raise ValueError("unexpected Docker context")
+              raw = read(DOCKER + ["version", "--format", "{{.Client.APIVersion}}|{{.Server.APIVersion}}|{{.Server.Os}}|{{.Server.Arch}}"])
+              api = re.fullmatch(r"1\.([0-9]+)\|1\.([0-9]+)\|linux\|arm64", raw)
+              if not api or not 49 <= int(api[1]) <= int(api[2]):
+                  raise ValueError("Docker API unsupported")
+              info = json.loads(read(DOCKER + ["info", "--format", "{{json .}}"]))
+              if [v for k, v in info["DriverStatus"] if k == "driver-type"] != ["io.containerd.snapshotter.v1"]:
+                  raise ValueError("Containerd store unverified")
+              if not info["ID"] or info["Containers"] != 0 or read(DOCKER + ["ps", "-aq"]):
+                  raise ValueError("daemon workload or identity unexpected")
+              counts = read(["sudo", "-n", "--", "stat", "-f", "-c", "%a %S", info["DockerRootDir"]])
+              free, block = map(int, counts.split())
+              if free * block < 2 * 1024**3:
+                  raise ValueError("daemon disk headroom insufficient")
+              mem = re.search(r"(?m)^MemAvailable:\s+([0-9]+) kB$", Path("/proc/meminfo").read_text())
+              if (not mem or int(mem[1]) < 2097152 or (os.cpu_count() or 0) < 2
+                      or int(read(["sudo", "-n", "--", "stat", "-f", "-c", "%d", info["DockerRootDir"]])) < 10000):
+                  raise ValueError("daemon resource headroom insufficient")
+              peers = read(["sudo", "-n", "--", "ss", "-H", "-xnp", "state", "established"])
+              check_peers(peers, listeners)
+              return f"1.{api[1]}", (info["ID"], pid, version, tuple(sorted(listeners.items())))
+
+
+          def inspect(ref, api, selected=False, receipt=None):
+              platform_json = json.dumps({"os": "linux", "architecture": "arm64", "variant": "v8"})
+              query = "?" + urlencode({"platform": platform_json}) if selected else ""
+              raw = read(["sudo", "-n", "--", "curl", "--disable", "--silent", "--show-error",
+                          "--noproxy", "*", "--unix-socket", SOCKET, "--max-time", "8",
+                          "--max-filesize", "65536", "--request", "GET", "--write-out", "\n%{http_code}",
+                          f"http://localhost/v{api}/images/{quote(ref, safe='/:@')}/json{query}"])
+              body, _, status = raw.rpartition("\n")
+              if receipt:
+                  print(f"{receipt} http_status={status if re.fullmatch('[1-5][0-9]{2}', status) else 'UNKNOWN'}")
+              if status not in {"200", "404"}:
+                  raise ValueError("unexpected image API response")
+              doc = json.loads(body)
+              if status == "404":
+                  if doc.get("message") not in {"No such image: " + ref, "No such image: " + ref.removeprefix("docker.io/library/")}:
+                      raise ValueError("image absence not proved")
+                  return None
+              return doc
+
+
+          def public_value(field, value):
+              if value is None:
+                  return "missing"
+              if field in {"Id", "Descriptor.digest", "DiffID"}:
+                  return value if isinstance(value, str) and re.fullmatch(r"sha256:[0-9a-f]{64}", value) else "redacted"
+              if field == "Descriptor.size" and type(value) is int and value >= 0:
+                  return value
+              if field == "Descriptor.mediaType" and isinstance(value, str) and value in ACCEPT.split(", "):
+                  return value
+              if field in {"Os", "Architecture", "Variant", "RootFS.Type"} and isinstance(value, str):
+                  if value in {"linux", "windows", "arm64", "amd64", "layers", "", "v7", "v8", "v9"}:
+                      return value or "empty"
+              return "redacted"
+
+
+          def verify_image(doc, descriptor, diffs, pinned_config, label):
+              checks = []
+              def equal(field, observed, expected):
+                  status = ("UNKNOWN" if observed is None else
+                            "PASS" if type(observed) is type(expected) and observed == expected else "FAIL")
+                  print(f"{label} {field}={status} expected={public_value(field, expected)} "
+                        f"observed={public_value(field, observed)}")
+                  checks.append(status)
+
+              desc = doc.get("Descriptor")
+              desc = desc if isinstance(desc, dict) else {}
+              equal("Id", doc.get("Id"), "sha256:" + MANIFEST)
+              for key in ("digest", "mediaType", "size"):
+                  equal("Descriptor." + key, desc.get(key), descriptor[key])
+              if "platform" in desc:
+                  plat = desc["platform"]
+                  matches = plat == descriptor["platform"]
+                  keys = set(plat) if isinstance(plat, dict) else set()
+                  detail = ",".join(
+                      f"{key}={public_value(field, plat.get(key))}" for key, field in
+                      (("os", "Os"), ("architecture", "Architecture"), ("variant", "Variant"))
+                  ) if isinstance(plat, dict) else "invalid"
+                  print(f"{label} Descriptor.platform={'PASS' if matches else 'FAIL'} "
+                        f"observed={detail} extra_keys={len(keys-descriptor['platform'].keys())}")
+                  checks.append("PASS" if matches else "FAIL")
+              else:
+                  print(f"{label} Descriptor.platform=UNKNOWN optional=absent")
+              equal("Os", doc.get("Os"), pinned_config["os"])
+              equal("Architecture", doc.get("Architecture"), pinned_config["architecture"])
+              # Variant in inspect is sourced from config, unlike the selected index descriptor.
+              equal("Variant", doc.get("Variant"), pinned_config["variant"])
+
+              root = doc.get("RootFS")
+              root = root if isinstance(root, dict) else {}
+              equal("RootFS.Type", root.get("Type"), pinned_config["rootfs"]["type"])
+              layers = root.get("Layers")
+              if isinstance(layers, list):
+                  same = layers == diffs
+                  count_status = "PASS" if len(layers) == len(diffs) else "FAIL"
+                  print(f"{label} RootFS.Layers.count={count_status} expected={len(diffs)} observed={len(layers)}")
+                  print(f"{label} RootFS.Layers.order={'PASS' if same else 'FAIL'}")
+                  if not same:
+                      mismatch = next((i for i,(a,b) in enumerate(zip(diffs,layers)) if a!=b),
+                                      min(len(diffs),len(layers)))
+                      expected = diffs[mismatch] if mismatch < len(diffs) else None
+                      observed = layers[mismatch] if mismatch < len(layers) else None
+                      print(f"{label} RootFS.Layers.first_difference={mismatch+1} "
+                            f"expected={public_value('DiffID', expected)} observed={public_value('DiffID', observed)}")
+                  checks.append("PASS" if same else "FAIL")
+              else:
+                  print(f"{label} RootFS.Layers.count=UNKNOWN RootFS.Layers.order=UNKNOWN expected={len(diffs)}")
+                  checks.append("UNKNOWN")
+              extras = len(set(root) - {"Type", "Layers"})
+              print(f"{label} RootFS.extra_fields={'FAIL' if extras else 'PASS'} count={extras}")
+              if extras:
+                  checks.append("FAIL")
+              config = doc.get("Config")
+              volumes = config.get("Volumes") if isinstance(config, dict) else None
+              expected = pinned_config["config"]["Volumes"]
+              verdict = ("UNKNOWN" if volumes is None else "PASS" if volumes == expected else "FAIL")
+              print(f"{label} Config.Volumes={verdict} expected_count={len(expected)} "
+                    f"observed_count={len(volumes) if isinstance(volumes, dict) else 'unknown'}")
+              checks.append(verdict)
+              return "FAIL" if "FAIL" in checks else "UNKNOWN" if "UNKNOWN" in checks else "PASS"
+
+
+          def diagnose(ref, api, selected, descriptor, diffs, pinned_config, label, resolutions):
+              try:
+                  doc = inspect(ref, api, selected=selected, receipt=label)
+              except (OSError, ValueError, TypeError, KeyError, subprocess.TimeoutExpired):
+                  resolutions[label] = "UNKNOWN"
+                  print(f"{label} resolution=UNKNOWN identity=NOT_RUN")
+                  return "UNKNOWN"
+              if doc is None:
+                  resolutions[label] = "ABSENT"
+                  print(f"{label} resolution=FAIL reason=REFERENCE_ABSENT identity=NOT_RUN")
+                  return "FAIL"
+              if not isinstance(doc, dict) or not doc:
+                  resolutions[label] = "UNKNOWN"
+                  print(f"{label} resolution=UNKNOWN identity=NOT_RUN")
+                  return "UNKNOWN"
+              resolutions[label] = "PRESENT"
+              print(f"{label} resolution=PASS")
+              verdict = verify_image(doc, descriptor, diffs, pinned_config, label)
+              print(f"{label} identity={verdict}")
+              return verdict
+
+
+          POSTGRES_REPOSITORY = "docker.io/library/postgres"
+
+
+          def campaign_annotations(image_name, descriptor):
+              if (not re.fullmatch(re.escape(POSTGRES_REPOSITORY) + r":aurora-probe-run-[0-9]{1,24}", image_name)
+                      or descriptor.get("digest") != "sha256:" + MANIFEST):
+                  raise ValueError("campaign reference or digest rejected")
+              return {"org.opencontainers.image.ref.name": image_name.rsplit(":", 1)[1],
+                      "io.containerd.image.name": image_name}
+
+
+          def load_receipt(result, image_name):
+              familiar = image_name.removeprefix("docker.io/library/")
+              names = (image_name, familiar, "sha256:" + MANIFEST)
+              lines = (result.stdout + b"\n" + result.stderr).decode(errors="replace").splitlines()
+              loaded = any(line in {"Loaded image: " + name, "Loaded image ID: " + name}
+                           for line in lines for name in names)
+              unpack_error = any(line.startswith("Error unpacking image ") for line in lines)
+              print(f"load.reference_observed={'yes' if loaded else 'no'} "
+                    f"unpack_error_reported={'yes' if unpack_error else 'no'}")
+              return unpack_error
+
+
+          def foreign_inventory(tag, normalized):
+              # Compare only local reference/ID metadata; never print foreign names.
+              raw = read(DOCKER + ["image", "ls", "--all", "--no-trunc", "--digests", "--format", "{{json .}}"])
+              records = []
+              for line in raw.splitlines():
+                  row = json.loads(line)
+                  entry = tuple(row[key] for key in ("Repository", "Tag", "Digest", "ID"))
+                  if not all(isinstance(value, str) for value in entry):
+                      raise ValueError("foreign inventory malformed")
+                  name = entry[0] + ":" + entry[1]
+                  if name in {tag, normalized} and entry[3] == "sha256:" + MANIFEST:
+                      continue
+                  records.append(entry)
+              return sorted(records)
+
+
+          def docker_inventory(api, tag, normalized, aliases):
+              from urllib.parse import urlencode
+              safe = set(aliases.values())
+              pins = {"sha256:" + value for value in (INDEX, MANIFEST, CONFIG)}
+              try:
+                  cli = read(DOCKER + ["image", "ls", "--all", "--no-trunc", "--filter",
+                                      "reference=" + normalized, "--format", "{{.ID}}"])
+                  ids = sorted(set(cli.splitlines()) & pins)
+                  print("docker_filtered_cli ids=" + (",".join(ids) or "none"))
+              except (OSError, ValueError, subprocess.TimeoutExpired):
+                  print("docker_filtered_cli=UNKNOWN")
+              try:
+                  query = urlencode({"all": "true", "filters": json.dumps({"reference": [tag, normalized]})})
+                  raw = read(["sudo", "-n", "--", "curl", "--disable", "--silent", "--show-error",
+                              "--fail", "--noproxy", "*", "--unix-socket", SOCKET, "--max-time", "8",
+                              "--max-filesize", "65536", "--request", "GET",
+                              f"http://localhost/v{api}/images/json?{query}"])
+                  rows = json.loads(raw)
+                  if not isinstance(rows, list):
+                      raise ValueError("unverified image list")
+                  found = []
+                  for row in rows:
+                      if not isinstance(row, dict) or row.get("Id") not in pins:
+                          continue
+                      refs = sorted((set(row.get("RepoTags") or []) | set(row.get("RepoDigests") or [])) & safe)
+                      found.append({"id": row["Id"], "references": refs})
+                  print("docker_filtered_api=" + json.dumps(found, sort_keys=True))
+              except (OSError, ValueError, TypeError, subprocess.TimeoutExpired):
+                  print("docker_filtered_api=UNKNOWN")
+
+
+          def containerd_refs(daemon, names, qualified):
+              # Only admitted dockerd, the explicit shared service socket, and Moby's
+              # documented default namespace. Otherwise omit the optional observation.
+              try:
+                  _, pid, version, _ = daemon
+                  args = Path(f"/proc/{pid}/cmdline").read_bytes().decode().rstrip("\0").split("\0")
+                  if version != "29.4.2" or not any(
+                      arg in {"--containerd=/run/containerd/containerd.sock",
+                              "--containerd=/var/run/containerd/containerd.sock"} for arg in args):
+                      raise ValueError("containerd endpoint unverified")
+                  address = "/run/containerd/containerd.sock"
+                  st = Path(address).lstat()
+                  if (not stat.S_ISSOCK(st.st_mode) or st.st_uid != 0
+                          or Path(address).resolve(strict=True) != Path(address)):
+                      raise ValueError("containerd socket unverified")
+                  source = ("from pathlib import Path; p=Path('/etc/docker/daemon.json'); "
+                            "print(p.open().read(65537) if p.exists() else '{}')")
+                  config = json.loads(read(["sudo", "-n", "--", "python3", "-I", "-B", "-c", source]),
+                                      object_pairs_hook=unique)
+                  if (not isinstance(config, dict) or "containerd" in config
+                          or config.get("containerd-namespace", "moby") != "moby"):
+                      raise ValueError("containerd namespace unverified")
+                  seen = set()
+                  for name in names:
+                      # Both filters are server-side. Never issue an unfiltered ctr list.
+                      selector = f'name=={json.dumps(name)},target.digest=={json.dumps("sha256:" + MANIFEST)}'
+                      rows = read(["sudo", "-n", "--", "ctr", "--address", address, "--namespace", "moby",
+                                   "images", "ls", "--quiet", selector]).splitlines()
+                      if rows not in ([], [name]):
+                          raise ValueError("containerd filter result unverified")
+                      if rows:
+                          seen.add(name)
+                  print("CONTAINERD_REFERENCE_OBSERVED refs=" + ",".join(sorted(seen)) if seen
+                        else "CONTAINERD_REFERENCE_UNKNOWN")
+                  unpacked = "UNKNOWN"
+                  try:
+                      if qualified in seen:
+                          driver = read(DOCKER + ["info", "--format", "{{.Driver}}"])
+                          if driver == "overlayfs":
+                              selector = f'name=={json.dumps(qualified)},target.digest=={json.dumps("sha256:" + MANIFEST)}'
+                              rows = read(["sudo", "-n", "--", "ctr", "--address", address, "--namespace", "moby",
+                                           "images", "check", "--snapshotter", driver, selector]).splitlines()
+                              if (len(rows) == 2 and rows[0].split()[-1:] == ["UNPACKED"]
+                                      and rows[1].split()[0:3] == [
+                                          qualified, "application/vnd.oci.image.manifest.v1+json", "sha256:" + MANIFEST]):
+                                  state = rows[1].split()[-1]
+                                  if state == "false":
+                                      unpacked = "FAIL"
+                                  elif state == "true" and rows[1].split()[3] == "complete":
+                                      unpacked = "PASS"
+                  except (OSError, ValueError, TypeError, IndexError, subprocess.TimeoutExpired):
+                      print("image_unpack_observation=UNKNOWN")
+                  return seen, unpacked
+              except (OSError, ValueError, KeyError, TypeError, subprocess.TimeoutExpired):
+                  print("CONTAINERD_REFERENCE_UNKNOWN")
+                  return None, "UNKNOWN"
+
+
+          def combined(*results):
+              if "FAIL" in results:
+                  return "FAIL"
+              return "UNKNOWN" if "UNKNOWN" in results else "PASS"
+
+
+          def normalization_confirmed(seen, tag, normalized, resolutions, manifest_result):
+              return (seen is not None and tag in seen and normalized not in seen
+                      and resolutions.get("tag_selected") == "ABSENT"
+                      and resolutions.get("normalized_selected") == "ABSENT"
+                      and manifest_result == "PASS")
+
+
+          RUNTIME_SAFE_ERRORS = ('PostgreSQL readiness timed out', 'bounded PostgreSQL operation failed', 'bounded PostgreSQL result too large', 'clean PostgreSQL stop not established', 'container ID unverified', 'container identity or isolation unverified', 'daemon changed before runtime', 'expected unique constraint rejection absent', 'initdb marker absent', 'invalid synthetic dump', 'restored schema differs', 'runtime resource collision', 'synthetic migration failure not detected', 'unexpected synthetic SQL result', 'unexpected volume creation receipt', 'volume mountpoint unverified', 'volume ownership unverified')
+          RUNTIME_STAGES = ("POSTGRESQL_NATIVE_START", "POSTGRESQL_READY", "PAPER_SQL_SMOKE",
+                            "SYNTHETIC_MIGRATIONS", "POSTGRESQL_RESTART", "POSTGRESQL_RESTORE")
+          PGDATA = "/var/lib/postgresql/data"
+          PASSWORD_PATH = "/run/test-password"
+          OWNER_LABEL = "qualification.run"
+
+
+          def bounded(args, timeout=20, data=None, check=True):
+              result = subprocess.run(DOCKER + args, input=data, capture_output=True, timeout=timeout, check=False)
+              if check and result.returncode:
+                  print(f"operation={args[0]} exit={result.returncode}")
+                  raise ValueError("bounded PostgreSQL operation failed")
+              if len(result.stdout) > 1048576 or len(result.stderr) > 1048576:
+                  raise ValueError("bounded PostgreSQL result too large")
+              return result
+
+
+          def sql_tool(cid, args, data=None, check=True):
+              program = 'PGPASSWORD="$(cat /run/test-password)"; export PGPASSWORD; exec "$@"'
+              flags = ["-h", "127.0.0.1", "-p", "5432", "-U", "smoke"]
+              opts = ["exec"]
+              if data is not None:
+                  opts.append("-i")
+              return bounded(opts + [cid, "sh", "-eu", "-c", program, "sh",
+                                      args[0]] + flags + args[1:], timeout=25, data=data, check=check)
+
+
+          def sql(cid, database, statement, expected=None, check=True):
+              result = sql_tool(cid, ["psql", "-X", "-qAt", "-v", "ON_ERROR_STOP=1",
+                                      "-v", "VERBOSITY=sqlstate", "-d", database],
+                                 statement.encode(), check=check)
+              if expected is not None and result.stdout.decode().strip() != expected:
+                  raise ValueError("unexpected synthetic SQL result")
+              return result
+
+
+          def wait_ready(cid):
+              deadline = time.monotonic() + 65
+              while time.monotonic() < deadline:
+                  result = bounded(["exec", cid, "pg_isready", "-h", "127.0.0.1", "-U", "smoke",
+                                    "-t", "1"], timeout=5, check=False)
+                  if not result.returncode:
+                      return
+                  time.sleep(1)
+              raise ValueError("PostgreSQL readiness timed out")
+
+
+          def version_and_data(cid):
+              sql(cid, "postgres", "SELECT current_setting('server_version_num'), current_setting('data_directory');",
+                  "160016|" + PGDATA)
+              print("postgresql_version=16.16 data_directory=" + PGDATA)
+
+
+          def synthetic_sql(cid):
+              sql(cid, "postgres", "CREATE DATABASE smoke_src;")
+              sql(cid, "smoke_src", """
+          CREATE TABLE sample(id integer PRIMARY KEY, key text UNIQUE NOT NULL, amount integer NOT NULL);
+          CREATE INDEX sample_amount_idx ON sample(amount);
+          BEGIN;
+          INSERT INTO sample VALUES (1,'alpha',10),(2,'beta',20);
+          COMMIT;
+          BEGIN;
+          UPDATE sample SET amount=11 WHERE id=1;
+          COMMIT;
+          BEGIN;
+          UPDATE sample SET amount=999 WHERE id=1;
+          INSERT INTO sample VALUES (3,'rollback-probe',30);
+          ROLLBACK;
+          SELECT id, key, amount FROM sample WHERE amount >= 10 ORDER BY id;
+          SELECT am.amname FROM pg_class c JOIN pg_am am ON am.oid=c.relam WHERE c.relname='sample_amount_idx';
+          """, "1|alpha|11\n2|beta|20\nbtree")
+              for test in ("INSERT INTO sample VALUES (1,'duplicate-pk',30);",
+                           "INSERT INTO sample VALUES (3,'alpha',30);"):
+                  result = sql(cid, "smoke_src", test, check=False)
+                  if not result.returncode or not re.search(rb"\b23505\b", result.stderr):
+                      raise ValueError("expected unique constraint rejection absent")
+              print("sql_commit=verified sql_rollback=verified constraint_sqlstate=23505 index=btree")
+
+
+          MIGRATIONS = (
+              "CREATE TABLE smoke_migration(version integer PRIMARY KEY); "
+              "CREATE TABLE synthetic_note(id integer PRIMARY KEY);",
+              "ALTER TABLE synthetic_note ADD COLUMN body text NOT NULL;",
+              "ALTER TABLE synthetic_note ADD CONSTRAINT synthetic_body_unique UNIQUE(body); "
+              "INSERT INTO synthetic_note VALUES (1,'fictitious');",
+          )
+          CONTENTS = "SELECT id,key,amount FROM sample ORDER BY id; SELECT version FROM smoke_migration ORDER BY version; SELECT id,body FROM synthetic_note ORDER BY id;"
+          EXPECTED = "1|alpha|11\n2|beta|20\n1\n2\n3\n1|fictitious"
+
+
+          def migrate(cid):
+              for number, ddl in enumerate(MIGRATIONS, 1):
+                  sql(cid, "smoke_src", f"BEGIN; {ddl} INSERT INTO smoke_migration VALUES ({number}); COMMIT;")
+              result = sql(cid, "smoke_src",
+                           "BEGIN; INSERT INTO smoke_migration VALUES (4); "
+                           "INSERT INTO synthetic_note VALUES (2,'fictitious'); COMMIT;", check=False)
+              if not result.returncode or not re.search(rb"\b23505\b", result.stderr):
+                  raise ValueError("synthetic migration failure not detected")
+              sql(cid, "smoke_src", CONTENTS, EXPECTED)
+              print("synthetic_versions=1,2,3 rejected_version=4 transaction_rolled_back=yes")
+
+
+          def schema(cid, database):
+              return sql(cid, database, """
+          SELECT table_name,column_name,data_type,is_nullable FROM information_schema.columns
+          WHERE table_schema='public' ORDER BY table_name,ordinal_position;
+          SELECT conrelid::regclass,conname,pg_get_constraintdef(oid) FROM pg_constraint
+          WHERE connamespace='public'::regnamespace ORDER BY 1,2;
+          SELECT indexname,indexdef FROM pg_indexes WHERE schemaname='public' ORDER BY indexname;
+          """).stdout
+
+
+          class Campaign:
+              def __init__(self, directory, run, daemon, api, immutable):
+                  self.cid = None
+                  self.volume_receipt = None
+                  self.volume = f"pg-smoke-data-{run}"
+                  self.name = f"pg-smoke-{run}"
+                  self.owner = os.urandom(16).hex()
+                  self.run, self.daemon, self.api, self.immutable = run, daemon, api, immutable
+                  self.password = directory / "pg-password"
+                  fd = os.open(self.password, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
+                  with os.fdopen(fd, "wb") as handle:
+                      handle.write(os.urandom(24).hex().encode() + b"\n")
+                  self.volume_attempted = self.container_attempted = False
+
+              def listed(self):
+                  return read(DOCKER + ["volume", "ls", "--filter", f"name=^{self.volume}$", "--format", "{{.Name}}"])
+
+              def volume_identity(self):
+                  info = json.loads(read(DOCKER + ["volume", "inspect", "--format", "{{json .}}", self.volume]))
+                  if (info["Name"], info["Driver"], info["Scope"], info["Labels"]) != (
+                          self.volume, "local", "local", {OWNER_LABEL: self.owner}) or info.get("Options"):
+                      raise ValueError("volume ownership unverified")
+                  if not Path(info["Mountpoint"]).is_absolute():
+                      raise ValueError("volume mountpoint unverified")
+                  return info
+
+              def container_identity(self):
+                  if not self.cid or not re.fullmatch("[a-f0-9]{64}", self.cid):
+                      raise ValueError("container ID unverified")
+                  info = json.loads(read(DOCKER + ["container", "inspect", "--format", "{{json .}}", self.cid]))
+                  config, host = info["Config"], info["HostConfig"]
+                  mounts = {(m["Type"], m.get("Name"), m["Source"], m["Destination"], m["RW"])
+                            for m in info["Mounts"]}
+                  expected_mounts = {("volume", self.volume, self.volume_receipt["Mountpoint"], PGDATA, True),
+                                     ("bind", None, str(self.password), PASSWORD_PATH, False)}
+                  if (info["Id"] != self.cid or info["Name"] != "/" + self.name
+                          or config["Labels"].get(OWNER_LABEL) != self.owner or config["Image"] != self.immutable
+                          or info["Image"] not in {"sha256:" + MANIFEST, "sha256:" + CONFIG}
+                          or host["NetworkMode"] != "none" or host["PortBindings"]
+                          or host["Privileged"] or host["PublishAllPorts"]
+                      or host["Memory"] != 335544320 or host["MemorySwap"] != 335544320
+                          or host["NanoCpus"] != 500000000 or host["PidsLimit"] != 48
+                          or mounts != expected_mounts or len(info["Mounts"]) != 2):
+                      raise ValueError("container identity or isolation unverified")
+                  return info
+
+              def create(self):
+                  if admission() != (self.api, self.daemon):
+                      raise ValueError("daemon changed before runtime")
+                  if self.listed() or read(DOCKER + ["ps", "-aq", "--filter", f"name=^/{self.name}$"]):
+                      raise ValueError("runtime resource collision")
+                  self.volume_attempted = True
+                  result = bounded(["volume", "create", "--driver", "local", "--label",
+                                    f"{OWNER_LABEL}={self.owner}", self.volume])
+                  if result.stdout.decode().strip() != self.volume:
+                      raise ValueError("unexpected volume creation receipt")
+                  self.volume_receipt = self.volume_identity()
+                  self.container_attempted = True
+                  result = bounded(["create", "--pull", "never", "--platform", "linux/arm64/v8",
+                                    "--name", self.name, "--label", f"{OWNER_LABEL}={self.owner}",
+                                    "--network", "none", "--cpus", "0.5", "--memory", "320m", "--memory-swap", "320m",
+                                    "--pids-limit", "48", "--security-opt", "no-new-privileges",
+                                    "--mount", f"type=volume,src={self.volume},dst={PGDATA},volume-nocopy",
+                                    "--mount", f"type=bind,src={self.password},dst={PASSWORD_PATH},readonly",
+                                    "--env", "POSTGRES_USER=smoke", "--env", "POSTGRES_DB=postgres",
+                                    "--env", f"POSTGRES_PASSWORD_FILE={PASSWORD_PATH}",
+                                    "--env", "POSTGRES_INITDB_ARGS=--auth-host=scram-sha-256",
+                                    self.immutable, "-c", "shared_buffers=16MB", "-c", "max_connections=12"])
+                  self.cid = result.stdout.decode().strip()
+                  self.container_identity()
+                  print("container_network=none published_ports=0 owned_mounts=2")
+
+              def start(self):
+                  self.container_identity()
+                  bounded(["start", self.cid], timeout=25)
+
+              def stop(self):
+                  info = self.container_identity()
+                  if info["State"]["Running"]:
+                      bounded(["stop", "--time", "15", self.cid], timeout=22)
+                  state = self.container_identity()["State"]
+                  if state["Running"] or state["ExitCode"] != 0:
+                      raise ValueError("clean PostgreSQL stop not established")
+
+              def cleanup(self):
+                  if not self.volume_attempted and not self.container_attempted:
+                      return "NOT_RUN"
+                  try:
+                      listeners = self.daemon[3]
+                      sock = Path(SOCKET).stat()
+                      if ((sock.st_dev, sock.st_ino) != dict(listeners)[API_SOCKET][:2]
+                              or read(DOCKER + ["info", "--format", "{{.ID}}"]) != self.daemon[0]):
+                          return "UNVERIFIED"
+                      if self.container_attempted:
+                          self.container_identity()
+                          if self.container_identity()["State"]["Running"]:
+                              # During a failure, still allow a verified owned container to stop.
+                              bounded(["stop", "--time", "15", self.cid], timeout=22)
+                          if self.container_identity()["State"]["Running"]:
+                              return "FAIL"
+                          bounded(["rm", self.cid])
+                          if read(DOCKER + ["ps", "-aq", "--no-trunc", "--filter", f"id={self.cid}"]) or read(
+                                  DOCKER + ["ps", "-aq", "--filter", f"name=^/{self.name}$"]):
+                              return "FAIL"
+                      if admission() != (self.api, self.daemon):
+                          return "UNVERIFIED"
+                      if not self.volume_receipt or self.volume_identity() != self.volume_receipt:
+                          return "UNVERIFIED"
+                      if read(DOCKER + ["ps", "-aq", "--filter", "volume=" + self.volume]):
+                          return "UNVERIFIED"
+                      # Non-forced removal of the exact owned name, only on the admitted job daemon.
+                      bounded(["volume", "rm", self.volume])
+                      return "FAIL" if self.listed() else "PASS"
+                  except (OSError, ValueError, KeyError, TypeError, subprocess.TimeoutExpired):
+                      return "UNVERIFIED"
+
+
+          def runtime(directory, run, daemon, api, immutable):
+              campaign = Campaign(directory, run, daemon, api, immutable)
+              verdicts = dict.fromkeys(RUNTIME_STAGES, "NOT_RUN")
+              cleanup = "NOT_RUN"
+              def run_stage(label, operation):
+                  verdicts[label] = "FAIL"
+                  print(label + "_BEGIN", flush=True)
+                  operation()
+                  verdicts[label] = "PASS"
+
+              def start():
+                  campaign.create()
+                  campaign.start()
+                  wait_ready(campaign.cid)
+                  version_and_data(campaign.cid)
+                  logs = bounded(["logs", campaign.cid]).stdout
+                  if b"PostgreSQL init process complete; ready for start up." not in logs:
+                      raise ValueError("initdb marker absent")
+                  print("initdb_complete=yes")
+
+              def ready():
+                  wait_ready(campaign.cid)
+                  sql(campaign.cid, "postgres", "SELECT current_user, inet_server_addr();", "smoke|127.0.0.1")
+                  print("pg_isready=PASS authenticated_sql=PASS")
+
+              def restart():
+                  campaign.stop()
+                  campaign.start()
+                  wait_ready(campaign.cid)
+                  version_and_data(campaign.cid)
+                  sql(campaign.cid, "smoke_src", CONTENTS, EXPECTED)
+                  print("same_container_and_volume=yes persisted_rows_and_migrations=verified")
+
+              def restore():
+                  cid = campaign.cid
+                  sql(cid, "postgres", "CREATE DATABASE smoke_restore;")
+                  dump = sql_tool(cid, ["pg_dump", "--format=custom", "smoke_src"]).stdout
+                  if not dump.startswith(b"PGDMP"):
+                      raise ValueError("invalid synthetic dump")
+                  sql_tool(cid, ["pg_restore", "--exit-on-error", "-d", "smoke_restore"], dump)
+                  sql(cid, "smoke_restore", CONTENTS, EXPECTED)
+                  if schema(cid, "smoke_restore") != schema(cid, "smoke_src"):
+                      raise ValueError("restored schema differs")
+                  print("dump_bytes=" + str(len(dump)) + " dump_sha256=" + hashlib.sha256(dump).hexdigest())
+                  print("restore_schema=match restore_rows=match")
+
+              try:
+                  for stage, operation in zip(RUNTIME_STAGES, (start, ready, lambda: synthetic_sql(campaign.cid),
+                                                               lambda: migrate(campaign.cid), restart, restore), strict=True):
+                      run_stage(stage, operation)
+              except (OSError, ValueError, KeyError, TypeError, subprocess.TimeoutExpired) as exc:
+                  reason = exc.args[0] if isinstance(exc, ValueError) and exc.args and exc.args[0] in RUNTIME_SAFE_ERRORS else type(exc).__name__
+                  print("runtime_error=" + reason)
+              finally:
+                  cleanup = campaign.cleanup()
+                  for stage, verdict in verdicts.items():
+                      print(stage + "_" + verdict)
+                  print("OWNED_RESOURCE_CLEANUP_" + cleanup)
+                  print("VM_DESTRUCTION_UNVERIFIED")
+              return all(value == "PASS" for value in verdicts.values()) and cleanup == "PASS"
+
+
+          def main():
+              attempted = False
+              content = diagnostics = runtime_started = False
+              try:
+                  try:
+                      api, daemon = admission()
+                  except (OSError, ValueError, KeyError, TypeError, subprocess.TimeoutExpired):
+                      print("DAEMON_EXCLUSIVITY_UNVERIFIED")
+                      raise
+                  run = os.environ["GITHUB_RUN_ID"]
+                  if not re.fullmatch("[0-9]{1,24}", run):
+                      raise ValueError("unverified run identifier")
+                  tag = f"postgres:aurora-probe-run-{run}"
+                  normalized = "docker.io/library/" + tag
+                  immutable = POSTGRES_REPOSITORY + "@sha256:" + MANIFEST
+                  aliases = (tag, normalized, immutable, "sha256:" + MANIFEST, "sha256:" + CONFIG,
+                             "sha256:" + INDEX, "docker.io/library/postgres@sha256:" + INDEX)
+                  with OPENER.open("https://auth.docker.io/token?service=registry.docker.io&scope=repository:library/postgres:pull", timeout=15) as response:
+                      token = json.load(response)["token"]
+                  with tempfile.TemporaryDirectory(prefix="oci-probe-", dir=os.environ["RUNNER_TEMP"]) as tmp:
+                      archive, descriptor, diffs, pinned_config = build(Path(tmp), token, normalized)
+                      content = True
+                      print("OCI_CONTENT_VERIFIED")
+                      with archive.open("rb") as stream:
+                          print("RECONSTRUCTED_TAR_SHA256=" + hashlib.file_digest(stream, "sha256").hexdigest())
+                      if any(inspect(ref, api) is not None for ref in aliases):
+                          raise ValueError("preexisting import reference")
+                      foreign_before = foreign_inventory(tag, normalized)
+                      try:
+                          if admission() != (api, daemon):
+                              raise ValueError("daemon changed")
+                      except (OSError, ValueError, KeyError, TypeError, subprocess.TimeoutExpired):
+                          print("DAEMON_EXCLUSIVITY_UNVERIFIED")
+                          raise
+                      print("DAEMON_ADMISSION_PASS")
+                      attempted = True
+                      result = subprocess.run(DOCKER + ["image", "load", "--platform", "linux/arm64/v8",
+                                                       "--input", str(archive)], capture_output=True,
+                                              timeout=90, check=False)
+                      print(f"load.exit={result.returncode}")
+                      if result.returncode:
+                          print("DOCKER_IMAGE_LOAD_FAIL")
+                          raise ValueError("OCI import was not successful")
+                      print("DOCKER_IMAGE_LOAD_PASS")
+                      if admission() != (api, daemon):
+                          raise ValueError("daemon changed after import")
+                      diagnostics = True
+                      refs = {"short_tag": tag, "normalized_tag": normalized, "canonical": immutable}
+                      unpack_error = load_receipt(result, normalized)
+                      docker_inventory(api, tag, normalized, refs)
+                      seen, unwrap = containerd_refs(daemon, (tag, normalized, immutable), normalized)
+                      unpack = "FAIL" if unpack_error else unwrap
+                      print("IMAGE_UNPACK_" + unpack)
+                      stored = ("UNKNOWN" if seen is None else
+                                "PASS" if normalized in seen and tag not in seen else "FAIL")
+                      print("CONTAINERD_REFERENCE_" + stored)
+                      foreign = ("PASS" if foreign_inventory(tag, normalized) == foreign_before else "FAIL")
+                      print("FOREIGN_IMAGE_INVENTORY_" + foreign)
+                      resolutions = {}
+                      def observe(ref, selected, label):
+                          return diagnose(ref, api, selected, descriptor, diffs, pinned_config, label, resolutions)
+                      short = observe(tag, True, "tag_selected")
+                      full = observe(normalized, True, "normalized_selected")
+                      digest = observe("sha256:" + MANIFEST, True, "manifest_selected")
+                      observe("sha256:" + CONFIG, True, "config_digest_selected")
+                      print("DOCKER_TAG_RESOLUTION_" + (
+                          "PASS" if all(resolutions.get(label) == "PRESENT" for label in ("tag_selected", "normalized_selected"))
+                          else "FAIL" if "ABSENT" in (resolutions.get("tag_selected"), resolutions.get("normalized_selected"))
+                          else "UNKNOWN"))
+                      print("MANIFEST_DIGEST_RESOLUTION_" + (
+                          "PASS" if resolutions.get("manifest_selected") == "PRESENT"
+                          else "FAIL" if resolutions.get("manifest_selected") == "ABSENT" else "UNKNOWN"))
+                      print("REFERENCE_NORMALIZATION_MISMATCH_" + (
+                          "CONFIRMED" if normalization_confirmed(seen, tag, normalized, resolutions, digest)
+                          else "UNVERIFIED"))
+                      selection = ("PASS" if "PASS" in (short, full, digest)
+                                   else "UNKNOWN" if "UNKNOWN" in (short, full, digest) else "FAIL")
+                      print("ARM64_MANIFEST_SELECTION_" + selection)
+                      canonical = observe(immutable, False, "canonical_target")
+                      selected = observe(immutable, True, "canonical_selected")
+                      result = combined(canonical, selected)
+                      print("CANONICAL_REFERENCE_" + result)
+                      if combined(short, full, digest, result, stored, unpack, foreign) != "PASS":
+                          raise ValueError("imported identity not established")
+                      print("OCI_RUNTIME_PREREQUISITE_PASS")
+                      runtime_started = True
+                      if not runtime(Path(tmp), run, daemon, api, immutable):
+                          return 1
+                      print("POSTGRESQL_ARM64_RUNTIME_SMOKE_PASS")
+              except (OSError, ValueError, KeyError, TypeError, subprocess.TimeoutExpired) as exc:
+                  if isinstance(exc, ValueError) and exc.args and exc.args[0] in SAFE_ERRORS:
+                      print("reason=" + exc.args[0])
+                  else:
+                      print("reason=" + type(exc).__name__)
+                  print("OCI_IMPORT_UNVERIFIED" if attempted else "OCI_IMPORT_NOT_RUN")
+                  return 1
+              finally:
+                  if not content:
+                      print("OCI_CONTENT_NOT_VERIFIED")
+                  if not attempted:
+                      print("DOCKER_IMAGE_LOAD_NOT_RUN")
+                  if not diagnostics:
+                      print("ARM64_MANIFEST_SELECTION_NOT_RUN")
+                      print("CANONICAL_REFERENCE_NOT_RUN")
+                  if not runtime_started:
+                      for stage in RUNTIME_STAGES:
+                          print(stage + "_NOT_RUN")
+                      print("OWNED_RESOURCE_CLEANUP_NOT_RUN")
+                  print("AURORA_PRIVATE_MIGRATIONS_NOT_TESTED")
+                  print("ORACLE_RUNTIME_NOT_TESTED")
+                  print("LOCAL_TAR_EXACT_BYTES_NOT_TESTED")
+                  if attempted:
+                      print("CLEANUP_UNVERIFIED")
+              return 0
+
+          def build(root, token, tag):
+              index = json.loads(fetch(token, "manifests", INDEX))
+              manifest_raw = fetch(token, "manifests", MANIFEST)
+              config_raw = fetch(token, "blobs", CONFIG)
+              manifest, config = map(json.loads, (manifest_raw, config_raw))
+              platform = {"os": "linux", "architecture": "arm64", "variant": "v8"}
+              matches = [row for row in index["manifests"] if row.get("platform") == platform]
+              if (len(matches) != 1 or matches[0]["digest"] != "sha256:" + MANIFEST
+                      or matches[0]["size"] != len(manifest_raw)
+                      or manifest["config"]["digest"] != "sha256:" + CONFIG
+                      or manifest["config"]["size"] != len(config_raw)
+                      or (config["os"], config["architecture"]) != ("linux", "arm64")):
+                  raise ValueError("reference chain mismatch")
+              layers = list(zip(manifest["layers"], config["rootfs"]["diff_ids"], strict=True))
+              if len(layers) != 14 or sum(l["size"] for l, _ in layers) != 164706129:
+                  raise ValueError("layer inventory mismatch")
+              if shutil.disk_usage(root).free < 3 * sum(l["size"] for l, _ in layers) + 1024**3:
+                  raise ValueError("insufficient local headroom")
+              files = {}
+              for descriptor, diff_id in layers:
+                  expected = descriptor["digest"]
+                  if descriptor["mediaType"] not in {"application/vnd.oci.image.layer.v1.tar+gzip",
+                                                        "application/vnd.docker.image.rootfs.diff.tar.gzip"}:
+                      raise ValueError("unsupported layer media type")
+                  key = expected.split(":", 1)[1]
+                  path = root / key
+                  fetch(token, "blobs", key, descriptor["size"], path)
+                  with gzip.open(path, "rb") as plain:
+                      if "sha256:" + hashlib.file_digest(plain, "sha256").hexdigest() != diff_id:
+                          raise ValueError("uncompressed DiffID mismatch")
+                  files["blobs/sha256/" + key] = path
+                  print(f"{expected} {descriptor['size']} {diff_id} PASS", flush=True)
+              tagged = dict(matches[0], annotations=campaign_annotations(tag, matches[0]))
+              files.update({
+                  "blobs/sha256/" + MANIFEST: manifest_raw,
+                  "blobs/sha256/" + CONFIG: config_raw,
+                  "oci-layout": b'{"imageLayoutVersion":"1.0.0"}\n',
+                  "index.json": json.dumps({"schemaVersion": 2, "manifests": [tagged]},
+                                           sort_keys=True, separators=(",", ":")).encode(),
+              })
+              print("OCI_SOURCE_INDEX_SHA256=" + INDEX)
+              print("OCI_RECONSTRUCTED_INDEX_SHA256=" + hashlib.sha256(files["index.json"]).hexdigest())
+              candidate = root / "image.tar"
+              with tarfile.open(candidate, mode="x", format=tarfile.USTAR_FORMAT) as archive:
+                  for name, source in sorted(files.items()):
+                      info = tarfile.TarInfo(name)
+                      info.size = len(source) if isinstance(source, bytes) else source.stat().st_size
+                      if isinstance(source, bytes):
+                          archive.addfile(info, io.BytesIO(source))
+                      else:
+                          with source.open("rb") as blob:
+                              archive.addfile(info, blob)
+              with tarfile.open(candidate, "r") as archive:
+                  if archive.getnames() != sorted(files):
+                      raise ValueError("OCI archive differs")
+                  for member in archive:
+                      with archive.extractfile(member) as content:
+                          observed = hashlib.file_digest(content, "sha256").hexdigest()
+                      if member.name.startswith("blobs/sha256/") and observed != member.name.rsplit("/", 1)[1]:
+                          raise ValueError("archive blob digest mismatch")
+                      if isinstance(files[member.name], bytes) and observed != hashlib.sha256(files[member.name]).hexdigest():
+                          raise ValueError("archive metadata digest mismatch")
+              return candidate, matches[0], config["rootfs"]["diff_ids"], config
+
+          SAFE_ERRORS = ('Containerd store unverified', 'Docker API unsupported', 'Docker TCP listener present', 'OCI archive differs', 'OCI import was not successful', 'Unix listener classification refused', 'additional socket ACL', 'archive blob digest mismatch', 'archive metadata digest mismatch', 'concurrent socket client observed', 'daemon changed', 'daemon changed after import', 'daemon configuration outside model', 'daemon disk headroom insufficient', 'daemon identity unverified', 'daemon resource headroom insufficient', 'daemon workload or identity unexpected', 'docker.service ExecStart differs from process', 'docker.socket has unexpected endpoint', 'dockerd launch options outside model', 'duplicate daemon configuration key', 'foreign socket principal', 'foreign inventory malformed', 'campaign reference or digest rejected', 'image absence not proved', 'imported identity not established', 'insufficient local headroom', 'invalid registry digest', 'layer inventory mismatch', 'preexisting import reference', 'primary socket replaced', 'read-only admission command failed', 'reference chain mismatch', 'registry object digest or size mismatch', 'registry object oversized', 'registry redirect unapproved', 'runner admission failed', 'runtime socket path alias unverified', 'socket access unexpected', 'uncompressed DiffID mismatch', 'unexpected Docker context', 'unexpected dockerd command', 'unexpected image API response', 'unsupported layer media type', 'unverified run identifier')
+
+          if __name__ == '__main__':
+              def interrupted(signum, frame):
+                  raise InterruptedError("runner termination requested")
+
+              signal.signal(signal.SIGTERM, interrupted)
+              sys.exit(main())
+          PY
