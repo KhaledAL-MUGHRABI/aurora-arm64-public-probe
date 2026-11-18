@@ -1,0 +1,312 @@
+name: ARM64 verified OCI import
+on:
+  workflow_dispatch:
+permissions: {}
+concurrency:
+  group: arm64-readonly-host-probe
+  cancel-in-progress: false
+jobs:
+  import:
+    runs-on: ubuntu-26.04-arm
+    timeout-minutes: 12
+    steps:
+      - name: Verify public OCI and conditionally import once
+        shell: bash
+        run: |
+          set -euo pipefail
+          export LC_ALL=C
+          python3 -I -B - <<'PY'
+          """Build a single-platform OCI image-layout tar, without a Docker daemon."""
+          import gzip
+          import hashlib
+          import io
+          import json
+          from pathlib import Path
+          import shutil
+          import tarfile
+          import tempfile
+          import urllib.request
+
+          INDEX = "dd2bf3ce2dc83a81674cf7f217fcfd8a5009a4b325dda5b843bfee82a06cff6f"
+          MANIFEST = "15364b278fab4a982ae09243c788e4df96a31a5b4bed50e6dab2d83420690653"
+          CONFIG = "2e7ed4ea03deedbb45c26c68bf2a7090dc68dd8518a9c75928c4b9b0f59bc411"
+
+
+
+          import errno
+          import grp
+          import os
+          import platform
+          import pwd
+          import re
+          import stat
+          import subprocess
+          import sys
+          from urllib.parse import quote, urlencode, urlsplit
+
+          SOCKET = "/var/run/docker.sock"
+          DOCKER = ["sudo", "-n", "--", "docker", "--host", "unix://" + SOCKET]
+          ACCEPT = ", ".join(("application/vnd.oci.image.index.v1+json",
+                              "application/vnd.oci.image.manifest.v1+json",
+                              "application/vnd.docker.distribution.manifest.list.v2+json",
+                              "application/vnd.docker.distribution.manifest.v2+json"))
+
+
+          class PublicRedirect(urllib.request.HTTPRedirectHandler):
+              def redirect_request(self, req, fp, code, msg, headers, target):
+                  parsed = urlsplit(target)
+                  if (parsed.scheme != "https" or parsed.username or parsed.password or
+                          parsed.hostname not in {
+                              "production.cloudflare.docker.com",
+                              "docker-images-prod.6aa30f8b08e16409b46e0173d6de2f56.r2.cloudflarestorage.com"}):
+                      raise ValueError("registry redirect unapproved")
+                  return urllib.request.Request(target, headers={"Accept": ACCEPT})
+
+
+          OPENER = urllib.request.build_opener(urllib.request.ProxyHandler({}), PublicRedirect())
+
+
+          def fetch(token, kind, pin, size=None, path=None):
+              if not re.fullmatch("[a-f0-9]{64}", pin):
+                  raise ValueError("invalid registry digest")
+              cap = 1048576 if size is None else size
+              url = f"https://registry-1.docker.io/v2/library/postgres/{kind}/sha256:{pin}"
+              request = urllib.request.Request(url, headers={"Authorization": "Bearer " + token, "Accept": ACCEPT})
+              output = io.BytesIO() if path is None else path.open("xb")
+              with output, OPENER.open(request, timeout=30) as response:
+                  digest, count = hashlib.sha256(), 0
+                  while chunk := response.read(1024**2):
+                      count += len(chunk)
+                      if count > cap:
+                          raise ValueError("registry object oversized")
+                      digest.update(chunk)
+                      output.write(chunk)
+                  if digest.hexdigest() != pin or size is not None and count != size:
+                      raise ValueError("registry object digest or size mismatch")
+                  return output.getvalue() if path is None else None
+
+
+          def read(args):
+              result = subprocess.run(args, capture_output=True, timeout=12, check=False)
+              if result.returncode or result.stderr or len(result.stdout) > 1048576:
+                  raise ValueError("read-only admission command failed")
+              return result.stdout.decode().strip()
+
+
+          def admission():
+              if (os.environ.get("RUNNER_ENVIRONMENT") != "github-hosted"
+                      or os.environ.get("GITHUB_REPOSITORY", "").lower() != "khaledal-mughrabi/aurora-arm64-public-probe"
+                      or os.environ.get("GITHUB_EVENT_NAME") != "workflow_dispatch"
+                      or os.environ.get("GITHUB_REF") != "refs/heads/main"
+                      or os.environ.get("GITHUB_RUN_ATTEMPT") != "1"
+                      or platform.machine() != "aarch64"
+                      or (platform.freedesktop_os_release().get("ID"),
+                          platform.freedesktop_os_release().get("VERSION_ID")) != ("ubuntu", "26.04")
+                      or any(os.environ.get(k) for k in ("DOCKER_HOST", "DOCKER_CONTEXT", "DOCKER_API_VERSION"))
+                      or os.getuid() == 0):
+                  raise ValueError("runner admission failed")
+              sock = Path(SOCKET)
+              st = sock.stat()
+              if not stat.S_ISSOCK(st.st_mode) or st.st_uid != 0 or stat.S_IMODE(st.st_mode) != 0o660:
+                  raise ValueError("socket access unexpected")
+              try:
+                  if os.getxattr(sock, "system.posix_acl_access"):
+                      raise ValueError("additional socket ACL")
+              except OSError as exc:
+                  if exc.errno not in {errno.ENODATA, errno.ENOTSUP}:
+                      raise
+              group = grp.getgrgid(st.st_gid)
+              users = set(group.gr_mem) | {u.pw_name for u in pwd.getpwall() if u.pw_gid == st.st_gid}
+              if not users <= {"root", pwd.getpwuid(os.getuid()).pw_name}:
+                  raise ValueError("foreign socket principal")
+              pid = int(read(["systemctl", "show", "docker.service", "--value", "--property", "MainPID"]))
+              if pid <= 1 or Path(f"/proc/{pid}/comm").read_text().strip() != "dockerd":
+                  raise ValueError("daemon identity unverified")
+              socket_path = re.compile(r"/(?:var/)?run/docker\.sock\b")
+              listeners = read(["sudo", "-n", "--", "ss", "-H", "-xlp"])
+              matched = [line for line in listeners.splitlines() if socket_path.search(line)]
+              if len(matched) != 1 or f"pid={pid}," not in matched[0]:
+                  raise ValueError("socket not tied to systemd daemon")
+              if any(f"pid={pid}," in line and not socket_path.search(line) for line in listeners.splitlines()):
+                  raise ValueError("additional daemon Unix listener")
+              tcp = read(["sudo", "-n", "--", "ss", "-H", "-ltnp"])
+              if f"pid={pid}," in tcp or '"dockerd"' in tcp:
+                  raise ValueError("Docker TCP listener present")
+              if read(DOCKER + ["context", "show"]) != "default":
+                  raise ValueError("unexpected Docker context")
+              raw = read(DOCKER + ["version", "--format", "{{.Client.APIVersion}}|{{.Server.APIVersion}}|{{.Server.Os}}|{{.Server.Arch}}"])
+              api = re.fullmatch(r"1\.([0-9]+)\|1\.([0-9]+)\|linux\|arm64", raw)
+              if not api or not 49 <= int(api[1]) <= int(api[2]):
+                  raise ValueError("Docker API unsupported")
+              info = json.loads(read(DOCKER + ["info", "--format", "{{json .}}"]))
+              if [v for k, v in info["DriverStatus"] if k == "driver-type"] != ["io.containerd.snapshotter.v1"]:
+                  raise ValueError("Containerd store unverified")
+              if not info["ID"] or info["Containers"] != 0 or read(DOCKER + ["ps", "-aq"]):
+                  raise ValueError("daemon workload or identity unexpected")
+              counts = read(["sudo", "-n", "--", "stat", "-f", "-c", "%a %S", info["DockerRootDir"]])
+              free, block = map(int, counts.split())
+              if free * block < 2 * 1024**3:
+                  raise ValueError("daemon disk headroom insufficient")
+              mem = re.search(r"(?m)^MemAvailable:\s+([0-9]+) kB$", Path("/proc/meminfo").read_text())
+              if (not mem or int(mem[1]) < 2097152 or (os.cpu_count() or 0) < 2
+                      or int(read(["sudo", "-n", "--", "stat", "-f", "-c", "%d", info["DockerRootDir"]])) < 10000):
+                  raise ValueError("daemon resource headroom insufficient")
+              peers = read(["sudo", "-n", "--", "ss", "-H", "-xnp", "state", "established"])
+              if any(socket_path.search(line) for line in peers.splitlines()):
+                  raise ValueError("concurrent socket client observed")
+              return f"1.{api[1]}", (info["ID"], pid, st.st_dev, st.st_ino)
+
+
+          def inspect(ref, api, selected=False):
+              platform_json = json.dumps({"os": "linux", "architecture": "arm64", "variant": "v8"})
+              query = "?" + urlencode({"platform": platform_json}) if selected else ""
+              raw = read(["sudo", "-n", "--", "curl", "--disable", "--silent", "--show-error",
+                          "--noproxy", "*", "--unix-socket", SOCKET, "--max-time", "8",
+                          "--max-filesize", "65536", "--request", "GET", "--write-out", "\n%{http_code}",
+                          f"http://localhost/v{api}/images/{quote(ref, safe='/:@')}/json{query}"])
+              body, _, status = raw.rpartition("\n")
+              if status not in {"200", "404"}:
+                  raise ValueError("unexpected image API response")
+              doc = json.loads(body)
+              if status == "404":
+                  if doc.get("message") not in {"No such image: " + ref, "No such image: " + ref.removeprefix("docker.io/library/")}:
+                      raise ValueError("image absence not proved")
+                  return None
+              return doc
+
+
+          def verify_image(doc, descriptor, diffs):
+              observed = (doc or {}).get("Descriptor") or {}
+              if (not doc or doc.get("Id") != "sha256:" + MANIFEST
+                      or any(observed.get(k) != descriptor[k] for k in ("digest", "size", "mediaType"))
+                      or ("platform" in observed and observed["platform"] != descriptor["platform"])
+                      or (doc.get("Os"), doc.get("Architecture")) != ("linux", "arm64")
+                      or doc.get("RootFS") != {"Type": "layers", "Layers": diffs}
+                      or (doc.get("Config") or {}).get("Volumes") != {"/var/lib/postgresql/data": {}}):
+                  raise ValueError("imported identity not established")
+
+
+          def main():
+              attempted = False
+              try:
+                  try:
+                      api, daemon = admission()
+                  except (OSError, ValueError, KeyError, TypeError, subprocess.TimeoutExpired):
+                      print("DAEMON_EXCLUSIVITY_UNVERIFIED")
+                      raise
+                  run = os.environ["GITHUB_RUN_ID"]
+                  if not re.fullmatch("[0-9]{1,24}", run):
+                      raise ValueError("unverified run identifier")
+                  tag = f"arm64-oci-probe:run-{run}"
+                  immutable = "docker.io/library/postgres@sha256:" + MANIFEST
+                  aliases = (tag, immutable, "sha256:" + MANIFEST, "sha256:" + CONFIG,
+                             "sha256:" + INDEX, "docker.io/library/postgres@sha256:" + INDEX)
+                  with OPENER.open("https://auth.docker.io/token?service=registry.docker.io&scope=repository:library/postgres:pull", timeout=15) as response:
+                      token = json.load(response)["token"]
+                  with tempfile.TemporaryDirectory(prefix="oci-probe-", dir=os.environ["RUNNER_TEMP"]) as tmp:
+                      archive, descriptor, diffs = build(Path(tmp), token, tag)
+                      with archive.open("rb") as stream:
+                          print("RECONSTRUCTED_TAR_SHA256=" + hashlib.file_digest(stream, "sha256").hexdigest())
+                      if any(inspect(ref, api) is not None for ref in aliases):
+                          raise ValueError("preexisting import reference")
+                      try:
+                          if admission() != (api, daemon):
+                              raise ValueError("daemon changed")
+                      except (OSError, ValueError, KeyError, TypeError, subprocess.TimeoutExpired):
+                          print("DAEMON_EXCLUSIVITY_UNVERIFIED")
+                          raise
+                      print("DAEMON_ADMISSION_PASS")
+                      attempted = True
+                      result = subprocess.run(DOCKER + ["image", "load", "--platform", "linux/arm64/v8",
+                                                       "--input", str(archive)], capture_output=True,
+                                              timeout=90, check=False)
+                      print(f"load.exit={result.returncode}")
+                      if result.returncode:
+                          raise ValueError("OCI import was not successful")
+                      if admission() != (api, daemon):
+                          raise ValueError("daemon changed after import")
+                      verify_image(inspect(tag, api, selected=True), descriptor, diffs)
+                      verify_image(inspect(immutable, api), descriptor, diffs)
+                      verify_image(inspect(immutable, api, selected=True), descriptor, diffs)
+                      print("NATIVE_OCI_IMPORT_PASS")
+              except (OSError, ValueError, KeyError, TypeError, subprocess.TimeoutExpired) as exc:
+                  if isinstance(exc, ValueError) and exc.args and exc.args[0] in SAFE_ERRORS:
+                      print("reason=" + exc.args[0])
+                  else:
+                      print("reason=" + type(exc).__name__)
+                  print("OCI_IMPORT_UNVERIFIED" if attempted else "OCI_IMPORT_NOT_RUN")
+                  return 1
+              finally:
+                  print("LOCAL_TAR_EXACT_BYTES_NOT_TESTED")
+                  if attempted:
+                      print("CLEANUP_UNVERIFIED")
+              return 0
+
+          def build(root, token, tag):
+              index = json.loads(fetch(token, "manifests", INDEX))
+              manifest_raw = fetch(token, "manifests", MANIFEST)
+              config_raw = fetch(token, "blobs", CONFIG)
+              manifest, config = map(json.loads, (manifest_raw, config_raw))
+              platform = {"os": "linux", "architecture": "arm64", "variant": "v8"}
+              matches = [row for row in index["manifests"] if row.get("platform") == platform]
+              if (len(matches) != 1 or matches[0]["digest"] != "sha256:" + MANIFEST
+                      or matches[0]["size"] != len(manifest_raw)
+                      or manifest["config"]["digest"] != "sha256:" + CONFIG
+                      or manifest["config"]["size"] != len(config_raw)
+                      or (config["os"], config["architecture"]) != ("linux", "arm64")):
+                  raise ValueError("reference chain mismatch")
+              layers = list(zip(manifest["layers"], config["rootfs"]["diff_ids"], strict=True))
+              if len(layers) != 14 or sum(l["size"] for l, _ in layers) != 164706129:
+                  raise ValueError("layer inventory mismatch")
+              if shutil.disk_usage(root).free < 3 * sum(l["size"] for l, _ in layers) + 1024**3:
+                  raise ValueError("insufficient local headroom")
+              files = {}
+              for descriptor, diff_id in layers:
+                  expected = descriptor["digest"]
+                  if descriptor["mediaType"] not in {"application/vnd.oci.image.layer.v1.tar+gzip",
+                                                        "application/vnd.docker.image.rootfs.diff.tar.gzip"}:
+                      raise ValueError("unsupported layer media type")
+                  key = expected.split(":", 1)[1]
+                  path = root / key
+                  fetch(token, "blobs", key, descriptor["size"], path)
+                  with gzip.open(path, "rb") as plain:
+                      if "sha256:" + hashlib.file_digest(plain, "sha256").hexdigest() != diff_id:
+                          raise ValueError("uncompressed DiffID mismatch")
+                  files["blobs/sha256/" + key] = path
+                  print(f"{expected} {descriptor['size']} {diff_id} PASS", flush=True)
+              tagged = dict(matches[0], annotations={"org.opencontainers.image.ref.name":
+                                                     tag})
+              files.update({
+                  "blobs/sha256/" + MANIFEST: manifest_raw,
+                  "blobs/sha256/" + CONFIG: config_raw,
+                  "oci-layout": b'{"imageLayoutVersion":"1.0.0"}\n',
+                  "index.json": json.dumps({"schemaVersion": 2, "manifests": [tagged]},
+                                           sort_keys=True, separators=(",", ":")).encode(),
+              })
+              candidate = root / "image.tar"
+              with tarfile.open(candidate, mode="x", format=tarfile.USTAR_FORMAT) as archive:
+                  for name, source in sorted(files.items()):
+                      info = tarfile.TarInfo(name)
+                      info.size = len(source) if isinstance(source, bytes) else source.stat().st_size
+                      if isinstance(source, bytes):
+                          archive.addfile(info, io.BytesIO(source))
+                      else:
+                          with source.open("rb") as blob:
+                              archive.addfile(info, blob)
+              with tarfile.open(candidate, "r") as archive:
+                  if archive.getnames() != sorted(files):
+                      raise ValueError("OCI archive differs")
+                  for member in archive:
+                      with archive.extractfile(member) as content:
+                          observed = hashlib.file_digest(content, "sha256").hexdigest()
+                      if member.name.startswith("blobs/sha256/") and observed != member.name.rsplit("/", 1)[1]:
+                          raise ValueError("archive blob digest mismatch")
+                      if isinstance(files[member.name], bytes) and observed != hashlib.sha256(files[member.name]).hexdigest():
+                          raise ValueError("archive metadata digest mismatch")
+              return candidate, matches[0], config["rootfs"]["diff_ids"]
+
+          SAFE_ERRORS = ('Containerd store unverified', 'Docker API unsupported', 'Docker TCP listener present', 'OCI archive differs', 'OCI import was not successful', 'additional daemon Unix listener', 'additional socket ACL', 'archive blob digest mismatch', 'archive metadata digest mismatch', 'concurrent socket client observed', 'daemon changed', 'daemon changed after import', 'daemon disk headroom insufficient', 'daemon identity unverified', 'daemon resource headroom insufficient', 'daemon workload or identity unexpected', 'foreign socket principal', 'image absence not proved', 'imported identity not established', 'insufficient local headroom', 'invalid registry digest', 'layer inventory mismatch', 'preexisting import reference', 'read-only admission command failed', 'reference chain mismatch', 'registry object digest or size mismatch', 'registry object oversized', 'registry redirect unapproved', 'runner admission failed', 'socket access unexpected', 'socket not tied to systemd daemon', 'uncompressed DiffID mismatch', 'unexpected Docker context', 'unexpected image API response', 'unsupported layer media type', 'unverified run identifier')
+
+          if __name__ == '__main__':
+              sys.exit(main())
+          PY
