@@ -1,0 +1,98 @@
+name: ARM64 Ubuntu 26.04 read-only probe
+on:
+  workflow_dispatch:
+permissions: {}
+concurrency:
+  group: arm64-readonly-host-probe
+  cancel-in-progress: false
+jobs:
+  probe:
+    runs-on: ubuntu-26.04-arm
+    timeout-minutes: 5
+    steps:
+      - name: Observe native runner and Docker capabilities
+        shell: bash
+        run: |
+          set -euo pipefail
+          export LC_ALL=C
+          echo DAEMON_EXCLUSIVITY_UNVERIFIED
+          echo OCI_IMPORT_NOT_RUN
+          printf 'campaign=%s-%s\n' "$GITHUB_RUN_ID" "$GITHUB_RUN_ATTEMPT"
+          . /etc/os-release
+          printf 'os=%s/%s %s\n' "$ID" "$VERSION_ID" "$PRETTY_NAME"
+          uname -m
+          uname -r
+          test "$(uname -m)" = aarch64
+          test "$ID/$VERSION_ID" = ubuntu/26.04
+          sudo -n -- /usr/bin/true
+          echo sudo_noninteractive=PASS
+          test -z "${DOCKER_API_VERSION:-}${DOCKER_HOST:-}${DOCKER_CONTEXT:-}"
+          socket=/var/run/docker.sock
+          test -S "$socket"
+          printf 'endpoint=unix://%s\n' "$socket"
+          stat -Lc 'socket device=%d inode=%i mode=%a uid=%u gid=%g' "$socket"
+          d() { sudo -n -- docker --host "unix://$socket" "$@"; }
+          context=$(d context show)
+          test "$context" = default
+          printf 'context=%s\n' "$context"
+          versions=$(d version --format '{{.Client.Version}}|{{.Client.DefaultAPIVersion}}|{{.Client.APIVersion}}|{{.Server.Version}}|{{.Server.APIVersion}}|{{.Server.Os}}|{{.Server.Arch}}')
+          printf 'docker_client|default_api|negotiated_api|docker_server|max_api|os|arch\n%s\n' "$versions"
+          python3 -I -B -c '
+          import re, sys
+          client, default, negotiated, server, maximum, os_name, arch = sys.argv[1].split("|")
+          def api(value):
+              if not re.fullmatch(r"[0-9]+\.[0-9]+", value):
+                  sys.exit("BLOCKED_API_UNVERIFIED")
+              return tuple(map(int, value.split(".")))
+          if min(api(default), api(negotiated), api(maximum)) < (1, 49):
+              sys.exit("BLOCKED_API_TOO_OLD")
+          if api(negotiated) > min(api(default), api(maximum)):
+              sys.exit("BLOCKED_API_CONTRADICTION")
+          if not client or not server or (os_name, arch) != ("linux", "arm64"):
+              sys.exit("BLOCKED_DOCKER_PLATFORM_UNVERIFIED")
+          ' "$versions"
+          store=$(d info --format '{{json .Driver}}|{{json .DriverStatus}}')
+          python3 -I -B -c '
+          import json, sys
+          driver, rows = map(json.loads, sys.argv[1].split("|", 1))
+          types = [v for k, v in rows or [] if k == "driver-type"]
+          if types == ["io.containerd.snapshotter.v1"] and driver:
+              print("store=containerd")
+          elif driver == "overlay2" and not types and any(k == "Backing Filesystem" and v for k, v in rows or []):
+              print("store=classic_overlay2")
+          else:
+              print("BLOCKED_IMAGE_STORE_UNKNOWN")
+              sys.exit(1)
+          ' "$store"
+          root=$(d info --format '{{.DockerRootDir}}')
+          case "$root" in /*) ;; *) exit 1 ;; esac
+          printf 'workspace_free_kib='
+          df -k --output=avail -- "$RUNNER_TEMP" | tail -n1 | tr -d ' '
+          for column in avail iavail; do
+            free=$(sudo -n -- df -k --output="$column" -- "$root" | tail -n1 | tr -d ' ')
+            printf 'docker_root_%s=%s\n' "$column" "$free"
+            [[ "$free" =~ ^[0-9]+$ ]] && test "$free" -gt 0
+          done
+          printf 'cpu_count='
+          getconf _NPROCESSORS_ONLN
+          awk '/^(MemAvailable|MemTotal):/ {print; if ($2 > 0 && $3 == "kB") found++} END {exit (found != 2)}' /proc/meminfo
+          for file in memory.max cpu.max pids.max; do
+            if test -r "/sys/fs/cgroup/$file"; then
+              printf '%s=' "$file"
+              cat "/sys/fs/cgroup/$file"
+            fi
+          done
+          # Inspect a campaign-specific content digest, never a tag or a real workload.
+          digest=$(printf 'arm64-readonly-probe:%s:%s' "$GITHUB_RUN_ID" "$GITHUB_RUN_ATTEMPT" | sha256sum | cut -d' ' -f1)
+          ref="sha256:$digest"
+          if observed=$(d image inspect --platform linux/arm64/v8 --format '{{.Id}}' "$ref" 2>&1); then
+            echo BLOCKED_PROBE_REFERENCE_UNEXPECTEDLY_PRESENT
+            exit 1
+          fi
+          case "$observed" in
+            "Error response from daemon: No such image: $ref"|"Error: No such image: $ref"|"No such image: $ref")
+              echo PLATFORM_INSPECT_READONLY_REQUEST_PASS ;;
+            *) echo BLOCKED_PLATFORM_INSPECT_UNVERIFIED; exit 1 ;;
+          esac
+          echo NATIVE_ARM64_PROBE_PASS
+          echo DOCKER_WRITES_NOT_AUTHORIZED
